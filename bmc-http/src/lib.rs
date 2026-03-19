@@ -111,29 +111,10 @@ pub trait HttpClient: Send + Sync {
 ///
 /// * `C` - The HTTP client implementation to use
 ///
-/// # Examples
-///
-/// ```rust,no_run
-/// use nv_redfish_bmc_http::HttpBmc;
-/// use nv_redfish_bmc_http::CacheSettings;
-/// use nv_redfish_bmc_http::BmcCredentials;
-/// use nv_redfish_bmc_http::reqwest::Client;
-/// use nv_redfish_core::{Bmc, ODataId};
-/// use url::Url;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let credentials = BmcCredentials::new("admin".to_string(), "password".to_string());
-/// let http_client = Client::new()?;
-/// let endpoint = Url::parse("https://192.168.1.100")?;
-///
-/// let bmc = HttpBmc::new(http_client, endpoint, credentials, CacheSettings::default());
-/// # Ok(())
-/// # }
-/// ```
 pub struct HttpBmc<C: HttpClient> {
     client: C,
     redfish_endpoint: RedfishEndpoint,
-    credentials: BmcCredentials,
+    credentials: RwLock<Arc<BmcCredentials>>,
     cache: RwLock<TypeErasedCarCache<ODataId>>,
     etags: RwLock<HashMap<ODataId, ODataETag>>,
     custom_headers: HeaderMap,
@@ -161,7 +142,7 @@ where
     /// use url::Url;
     ///
     /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let credentials = BmcCredentials::new("admin".to_string(), "password".to_string());
+    /// let credentials = BmcCredentials::username_password("admin".to_string(), Some("password".to_string()));
     /// let http_client = Client::new()?;
     /// let endpoint = Url::parse("https://192.168.1.100")?;
     ///
@@ -213,7 +194,7 @@ where
     /// use http::HeaderMap;
     ///
     /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let credentials = BmcCredentials::new("admin".to_string(), "password".to_string());
+    /// let credentials = BmcCredentials::username_password("admin".to_string(), Some("password".to_string()));
     /// let http_client = Client::new()?;
     /// let endpoint = Url::parse("https://192.168.1.100")?;
     ///
@@ -245,11 +226,24 @@ where
         Self {
             client,
             redfish_endpoint: RedfishEndpoint::from(redfish_endpoint),
-            credentials,
+            credentials: RwLock::new(Arc::new(credentials)),
             cache: RwLock::new(TypeErasedCarCache::new(cache_settings.capacity)),
             etags: RwLock::new(HashMap::new()),
             custom_headers,
         }
+    }
+
+    /// Replace the credentials used for subsequent requests.
+    ///
+    /// Existing cache and ETag state is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials lock is poisoned.
+    pub fn set_credentials(&self, credentials: BmcCredentials) -> Result<(), String> {
+        let mut current = self.credentials.write().expect("poisoned");
+        *current = Arc::new(credentials);
+        Ok(())
     }
 }
 
@@ -332,6 +326,13 @@ impl<C: HttpClient> HttpBmc<C>
 where
     C::Error: CacheableError + StdError + Send + Sync,
 {
+    fn read_credentials(&self) -> Arc<BmcCredentials> {
+        self.credentials
+            .read()
+            .map(|credentials| Arc::clone(&credentials))
+            .expect("lock poisoned")
+    }
+
     /// Perform a GET request with `ETag` caching support
     ///
     /// This handles:
@@ -355,11 +356,17 @@ where
                 .map_err(|e| C::Error::cache_error(e.to_string()))?;
             etags.get(id).cloned()
         };
+        let credentials = self.read_credentials();
 
         // Perform GET request
         match self
             .client
-            .get::<T>(endpoint_url, &self.credentials, etag, &self.custom_headers)
+            .get::<T>(
+                endpoint_url,
+                credentials.as_ref(),
+                etag,
+                &self.custom_headers,
+            )
             .await
         {
             Ok(response) => {
@@ -435,8 +442,9 @@ where
         v: &V,
     ) -> Result<ModificationResponse<R>, Self::Error> {
         let endpoint_url = self.redfish_endpoint.with_path(&id.to_string());
+        let credentials = self.read_credentials();
         self.client
-            .post(endpoint_url, v, &self.credentials, &self.custom_headers)
+            .post(endpoint_url, v, credentials.as_ref(), &self.custom_headers)
             .await
     }
 
@@ -450,12 +458,13 @@ where
         let etag = etag
             .cloned()
             .unwrap_or_else(|| ODataETag::from(String::from("*")));
+        let credentials = self.read_credentials();
         self.client
             .patch(
                 endpoint_url,
                 etag,
                 v,
-                &self.credentials,
+                credentials.as_ref(),
                 &self.custom_headers,
             )
             .await
@@ -466,8 +475,9 @@ where
         id: &ODataId,
     ) -> Result<ModificationResponse<T>, Self::Error> {
         let endpoint_url = self.redfish_endpoint.with_path(&id.to_string());
+        let credentials = self.read_credentials();
         self.client
-            .delete(endpoint_url, &self.credentials, &self.custom_headers)
+            .delete(endpoint_url, credentials.as_ref(), &self.custom_headers)
             .await
     }
 
@@ -480,11 +490,12 @@ where
         params: &T,
     ) -> Result<ModificationResponse<R>, Self::Error> {
         let endpoint_url = self.redfish_endpoint.with_path(&action.target.to_string());
+        let credentials = self.read_credentials();
         self.client
             .post(
                 endpoint_url,
                 params,
-                &self.credentials,
+                credentials.as_ref(),
                 &self.custom_headers,
             )
             .await
@@ -507,8 +518,9 @@ where
         uri: &str,
     ) -> Result<BoxTryStream<T, Self::Error>, Self::Error> {
         let endpoint_url = Url::parse(uri).unwrap_or_else(|_| self.redfish_endpoint.with_path(uri));
+        let credentials = self.read_credentials();
         self.client
-            .sse(endpoint_url, &self.credentials, &self.custom_headers)
+            .sse(endpoint_url, credentials.as_ref(), &self.custom_headers)
             .await
     }
 }
