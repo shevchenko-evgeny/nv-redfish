@@ -20,24 +20,32 @@
 
 mod software_inventory;
 
-use crate::core::NavProperty;
-use crate::patch_support::Payload;
-use crate::patch_support::ReadPatchFn;
-use crate::schema::update_service::UpdateService as UpdateServiceSchema;
-use crate::schema::update_service::UpdateServiceSimpleUpdateAction;
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::Error;
 use crate::NvBmc;
 use crate::Resource;
 use crate::ResourceSchema;
 use crate::ServiceRoot;
+use crate::core::NavProperty;
+use crate::patch_support::Payload;
+use crate::patch_support::ReadPatchFn;
+use crate::schema::update_service::UpdateService as UpdateServiceSchema;
+use crate::schema::update_service::UpdateServiceSimpleUpdateAction;
+
 use nv_redfish_core::Bmc;
+use nv_redfish_core::DataStream;
 use nv_redfish_core::ModificationResponse;
+use nv_redfish_core::MultipartUpdateRequest;
+use nv_redfish_core::UploadReader;
 use serde_json::Value as JsonValue;
 use software_inventory::SoftwareInventoryCollection;
-use std::sync::Arc;
 
 #[doc(inline)]
 pub use crate::schema::update_service::TransferProtocolType;
+#[doc(inline)]
+pub use crate::schema::update_service::UpdateParametersUpdate as MultipartUpdateParameters;
 #[doc(inline)]
 pub use software_inventory::SoftwareInventory;
 #[doc(inline)]
@@ -173,8 +181,10 @@ impl<B: Bmc> UpdateService<B> {
     /// * `username` - Optional username for accessing the image URI
     /// * `password` - Optional password for accessing the image URI
     /// * `force_update` - Whether to bypass update policies (e.g., allow downgrade)
-    /// * `stage` - Whether to stage the image for later activation instead of immediate installation
-    /// * `local_image` - An indication of whether the service adds the image to the local image store
+    /// * `stage` - Whether to stage the image for later activation instead of immediate
+    ///   installation
+    /// * `local_image` - An indication of whether the service adds the image to the local image
+    ///   store
     /// * `exclude_targets` - An array of URIs that indicate where not to apply the update image
     ///
     /// # Errors
@@ -223,7 +233,8 @@ impl<B: Bmc> UpdateService<B> {
             .map_err(Error::Bmc)
     }
 
-    /// Start updates that have been previously invoked with an `OperationApplyTime` of `OnStartUpdateRequest`.
+    /// Start updates that have been previously invoked with an `OperationApplyTime` of
+    /// `OnStartUpdateRequest`.
     ///
     /// # Errors
     ///
@@ -242,6 +253,63 @@ impl<B: Bmc> UpdateService<B> {
 
         actions
             .start_update(self.bmc.as_ref())
+            .await
+            .map_err(Error::Bmc)
+    }
+
+    /// Upload a named stream using this service's `MultipartHttpPushUri`.
+    ///
+    /// Prefer the generated [`MultipartUpdateParameters`] type. A generic
+    /// payload is accepted for platform fields that are not generated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `MultipartHttpPushUri` is absent or the upload fails.
+    pub async fn multipart_update_from_reader<U, V, R>(
+        &self,
+        update_parameters: &V,
+        update_stream: DataStream<U>,
+        upload_timeout: Duration,
+    ) -> Result<ModificationResponse<R>, Error<B>>
+    where
+        U: UploadReader,
+        V: Send + Sync + serde::Serialize,
+        R: Send + Sync + for<'de> serde::Deserialize<'de>,
+    {
+        self.multipart_update(MultipartUpdateRequest {
+            update_parameters,
+            update_stream,
+            oem_parts: Vec::new(),
+            upload_timeout,
+        })
+        .await
+    }
+
+    /// Perform a multipart upload using this service's `MultipartHttpPushUri`.
+    ///
+    /// Use this method when the request needs optional OEM multipart parts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `MultipartHttpPushUri` is absent or the upload fails.
+    pub async fn multipart_update<U, V, R>(
+        &self,
+        request: MultipartUpdateRequest<'_, U, V>,
+    ) -> Result<ModificationResponse<R>, Error<B>>
+    where
+        U: UploadReader,
+        V: Send + Sync + serde::Serialize,
+        R: Send + Sync + for<'de> serde::Deserialize<'de>,
+    {
+        let multipart_uri = self
+            .data
+            .multipart_http_push_uri
+            .as_ref()
+            .ok_or(Error::UpdateServiceMultipartHttpPushUriNotAvailable)?;
+
+        self.bmc
+            .as_ref()
+            .multipart_update(multipart_uri, request)
             .await
             .map_err(Error::Bmc)
     }
