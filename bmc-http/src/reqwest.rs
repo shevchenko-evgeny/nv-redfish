@@ -23,6 +23,7 @@ use crate::BmcCredentials;
 use crate::CacheableError;
 use crate::HttpClient;
 use crate::MultipartUpdateRequest;
+use crate::schema::redfish::redfish_error::RedfishError;
 
 use futures_util::StreamExt as _;
 use http::HeaderMap;
@@ -430,10 +431,30 @@ impl Client {
                         if let Some(etag) = etag {
                             inject_etag(&etag, &mut value);
                         }
-                        return serde_path_to_error::deserialize(value)
-                            .map(ModificationResponse::Entity)
-                            .map_err(BmcError::JsonError);
                     }
+
+                    // Non-empty 200/201 bodies are typed responses selected by the caller.
+                    //
+                    // - These bodies are not required to be Redfish resources with @odata.id.
+                    //
+                    // - DSP0266 POST actions with no response body may still return "an error
+                    //   response, with a message that indicates success".
+                    return match serde_path_to_error::deserialize(&value) {
+                        // Non-empty 200/201 body matched the caller-selected type.
+                        Ok(entity) => Ok(ModificationResponse::Entity(entity)),
+                        Err(err) => {
+                            if expects_no_response_body::<T>()
+                                && is_redfish_success_response(&value)
+                            {
+                                // No-response action returned a Redfish success envelope.
+                                Ok(ModificationResponse::Empty)
+                            } else {
+                                // The response was successful JSON, but it did
+                                // not match the caller-selected response type.
+                                Err(BmcError::JsonError(err))
+                            }
+                        }
+                    };
                 }
 
                 if let Some(location) = location {
@@ -580,6 +601,31 @@ fn inject_etag(etag: &ODataETag, body: &mut serde_json::Value) {
             .and_modify(|v| *v = etag_value.clone())
             .or_insert(etag_value);
     }
+}
+
+/// DSP0266 7.11, Table 10 allows actions without response bodies to return
+/// an error-shaped success body. Only that body should become Empty.
+#[inline]
+fn is_redfish_success_response(value: &serde_json::Value) -> bool {
+    let Ok(response) = <RedfishError as serde::Deserialize>::deserialize(value) else {
+        return false;
+    };
+
+    let code = response.error.code.as_str();
+    let message = code.rsplit_once('.').map_or(code, |(_, message)| message);
+
+    matches!(message, "Success" | "Created" | "NoOperation")
+}
+
+/// Distinguishes no-response callers like () from typed response callers.
+/// The same endpoint can be called with different R types, so only callers
+/// whose R can represent no body may map a success envelope to Empty.
+#[inline]
+fn expects_no_response_body<T>() -> bool
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value::<T>(serde_json::Value::Null).is_ok()
 }
 
 fn auth_headers(
