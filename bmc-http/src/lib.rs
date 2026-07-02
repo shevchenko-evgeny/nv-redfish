@@ -214,8 +214,8 @@ pub struct HttpBmc<C: HttpClient> {
     client: C,
     redfish_endpoint: RedfishEndpoint,
     credentials: RwLock<Arc<BmcCredentials>>,
-    cache: RwLock<TypeErasedCarCache<ODataId>>,
-    etags: RwLock<HashMap<ODataId, ODataETag>>,
+    cache: RwLock<TypeErasedCarCache<Url>>,
+    etags: RwLock<HashMap<Url, ODataETag>>,
     custom_headers: HeaderMap,
 }
 
@@ -470,6 +470,8 @@ impl Default for CacheSettings {
 
 impl CacheSettings {
     /// Define capacity of the cache measured in number of items.
+    ///
+    /// A capacity of 0 disables caching.
     #[must_use]
     pub const fn with_capacity(capacity: usize) -> Self {
         Self { capacity }
@@ -531,15 +533,16 @@ where
     async fn get_with_cache<T: EntityTypeRef + for<'de> Deserialize<'de> + 'static>(
         &self,
         endpoint_url: Url,
-        id: &ODataId,
     ) -> Result<Arc<T>, C::Error> {
+        let cache_key = endpoint_url.clone();
+
         // Retrieve cached etag
         let etag: Option<ODataETag> = {
             let etags = self
                 .etags
                 .read()
                 .map_err(|e| C::Error::cache_error(e.to_string()))?;
-            etags.get(id).cloned()
+            etags.get(&cache_key).cloned()
         };
         let credentials = self.read_credentials();
 
@@ -569,10 +572,12 @@ where
                         .write()
                         .map_err(|e| C::Error::cache_error(e.to_string()))?;
 
-                    if let Some(evicted_id) = cache.put_typed(id.clone(), Arc::clone(&entity)) {
-                        etags.remove(&evicted_id);
+                    if let Some(evicted_url) =
+                        cache.put_typed(cache_key.clone(), Arc::clone(&entity))
+                    {
+                        etags.remove(&evicted_url);
                     }
-                    etags.insert(id.clone(), etag.clone());
+                    etags.insert(cache_key.clone(), etag.clone());
                 }
                 Ok(entity)
             }
@@ -584,7 +589,7 @@ where
                         .write()
                         .map_err(|e| C::Error::cache_error(e.to_string()))?;
                     cache
-                        .get_typed::<Arc<T>>(id)
+                        .get_typed::<Arc<T>>(&cache_key)
                         .cloned()
                         .ok_or_else(C::Error::cache_miss)
                 } else {
@@ -606,7 +611,7 @@ where
         id: &ODataId,
     ) -> Result<Arc<T>, Self::Error> {
         let endpoint_url = self.redfish_endpoint.with_path(&id.to_string());
-        self.get_with_cache(endpoint_url, id).await
+        self.get_with_cache(endpoint_url).await
     }
 
     async fn expand<T: Expandable + 'static>(
@@ -618,7 +623,7 @@ where
             .redfish_endpoint
             .with_path_and_query(&id.to_string(), &query.to_query_string());
 
-        self.get_with_cache(endpoint_url, id).await
+        self.get_with_cache(endpoint_url).await
     }
 
     async fn create<V: Sync + Send + Serialize, R: Sync + Send + for<'de> Deserialize<'de>>(
@@ -764,7 +769,7 @@ where
             .redfish_endpoint
             .with_path_and_query(&id.to_string(), &query.to_query_string());
 
-        self.get_with_cache(endpoint_url, id).await
+        self.get_with_cache(endpoint_url).await
     }
 
     async fn stream<T: Send + Sized + for<'de> Deserialize<'de>>(
