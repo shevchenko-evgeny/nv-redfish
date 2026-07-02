@@ -51,7 +51,8 @@ std-not-standalone-features = assembly \
              power-supplies \
              secure-boot \
              sensors \
-             storages
+             storages \
+             update-service-deprecated
 
 std-standalone-features = $(filter-out $(std-not-standalone-features),$(all-std-features))
 
@@ -60,6 +61,7 @@ ci-features-list := $(subst $(space),$(comma),$(all-std-features))
 compile-one-feature = $(indent)cargo build -p nv-redfish --features $1$(new-line)
 
 define build-and-test
+	cargo fmt --all -- --check
 	cargo build -p nv-redfish --features computer-systems,processors,controls
 	cargo build -p nv-redfish --features managers,oem-hpe
 	cargo build -p nv-redfish --features managers,oem-supermicro
@@ -101,7 +103,7 @@ ci: rust-install
 	$(call build-and-test,--features $(ci-features-list))
 
 rust-install:
-	rustup component add clippy
+	rustup component add clippy rustfmt
 
 clean:
 	rm -rf $(schema-dir)

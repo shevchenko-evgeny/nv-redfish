@@ -268,8 +268,12 @@ pub struct ClientParams {
     pub user_agent: Option<String>,
     /// Whether to accept invalid TLS certificates
     pub accept_invalid_certs: bool,
-    /// Maximum number of HTTP redirects to follow
+
+    /// Maximum number of same-origin HTTP redirects to follow.
+    ///
+    /// `None` uses reqwest's default redirect limit. Cross-origin redirects are always rejected.
     pub max_redirects: Option<usize>,
+
     /// TCP keep-alive timeout
     pub tcp_keepalive: Option<Duration>,
     /// Connection pool idle timeout
@@ -337,7 +341,7 @@ impl ClientParams {
         self
     }
 
-    /// See: [`reqwest::ClientBuilder::redirect`].
+    /// Sets the maximum number of same-origin redirects to follow.
     #[must_use]
     pub const fn max_redirects(mut self, max: usize) -> Self {
         self.max_redirects = Some(max);
@@ -438,9 +442,15 @@ impl Client {
             builder = builder.danger_accept_invalid_certs(true);
         }
 
-        if let Some(max_redirects) = params.max_redirects {
-            builder = builder.redirect(RedirectPolicy::limited(max_redirects));
-        }
+        // Reqwest's standard policies enforce redirect limits but still follow cross-origin
+        // targets, where Redfish-specific and custom authentication headers can be forwarded.
+        // Wrap the selected standard policy so its limit and error behavior remain unchanged
+        // while every redirect also receives the same-origin check.
+        let redirect_policy = params
+            .max_redirects
+            .map_or_else(RedirectPolicy::default, RedirectPolicy::limited);
+
+        builder = builder.redirect(same_origin_redirect_policy(redirect_policy));
 
         if let Some(keepalive) = params.tcp_keepalive {
             builder = builder.tcp_keepalive(keepalive);
@@ -464,7 +474,15 @@ impl Client {
         })
     }
 
-    /// Use pre-built [`reqwest::Client`] as internal client.
+    /// Uses a pre-built [`reqwest::Client`] as the internal client.
+    ///
+    /// Unlike [`Self::new`] and [`Self::with_params`], this constructor cannot install or inspect
+    /// the client's redirect policy.
+    ///
+    /// # Security
+    ///
+    /// The supplied client must reject cross-origin redirects. Reqwest's default redirect policy
+    /// can forward Redfish `X-Auth-Token` and arbitrary custom headers to another origin.
     #[must_use]
     pub const fn with_client(client: ReqwestClient) -> Self {
         Self {
@@ -551,12 +569,17 @@ impl Client {
         }
 
         let etag = etag_from_headers(&headers);
-        let location = location_from_headers(&headers);
+
+        // Resolve the header once, but defer propagating its error until a
+        // status branch actually uses Location. A malformed, irrelevant
+        // Location must not turn a valid 204 or body-bearing 200/201 into an
+        // error.
+        let location = location_from_headers(&headers, &url, status);
 
         match status {
             reqwest::StatusCode::NO_CONTENT => Ok(ModificationResponse::Empty),
             reqwest::StatusCode::ACCEPTED => {
-                let Some(task_location) = location else {
+                let Some(task_location) = location? else {
                     return Err(BmcError::InvalidResponse {
                         url,
                         status,
@@ -604,7 +627,7 @@ impl Client {
                     };
                 }
 
-                if let Some(location) = location {
+                if let Some(location) = location? {
                     let value = serde_json::json!({ "@odata.id": location });
                     return serde_path_to_error::deserialize(value)
                         .map(ModificationResponse::Entity)
@@ -646,7 +669,10 @@ impl Client {
                 text: String::from("session creation response missing X-Auth-Token header"),
             });
         };
-        let Some(location) = location_from_headers(&headers) else {
+
+        // The returned location is the durable session identifier used for
+        // later deletion, so normalize and validate it before exposing it.
+        let Some(location) = location_from_headers(&headers, &url, status)? else {
             return Err(BmcError::InvalidResponse {
                 url,
                 status,
@@ -699,23 +725,80 @@ impl Client {
     }
 }
 
-fn location_from_headers(headers: &HeaderMap) -> Option<ODataId> {
-    headers
-        .get(header::LOCATION)
-        .and_then(|value| value.to_str().ok())
-        .map(|raw| {
-            Url::parse(raw).map_or_else(
-                |_| raw.to_string().into(),
-                |url| {
-                    let mut path = url.path().to_string();
-                    if let Some(query) = url.query() {
-                        path.push('?');
-                        path.push_str(query);
-                    }
-                    path.into()
-                },
-            )
-        })
+/// Wraps a redirect policy to reject cross-origin targets.
+fn same_origin_redirect_policy(redirect_policy: RedirectPolicy) -> RedirectPolicy {
+    RedirectPolicy::custom(move |attempt| {
+        let Some(original_url) = attempt.previous().first() else {
+            return attempt.error("redirect attempt is missing the original URL");
+        };
+
+        if attempt.url().origin() != original_url.origin() {
+            return attempt.error("cross-origin redirects are not allowed");
+        }
+
+        redirect_policy.redirect(attempt)
+    })
+}
+
+/// Resolve a Redfish `Location` header into a same-origin path and query.
+///
+/// HTTP defines `Location` as a URI reference, so values may be absolute,
+/// root-relative, path-relative, or query-only. Resolution must use the final
+/// response URL; treating a relative value as a path rooted at the configured
+/// BMC endpoint can target a different resource. The returned `ODataId` keeps
+/// only path and query because fragments are not sent in subsequent HTTP
+/// requests and transport always uses the configured BMC origin.
+fn location_from_headers(
+    headers: &HeaderMap,
+    response_url: &Url,
+    status: reqwest::StatusCode,
+) -> Result<Option<ODataId>, BmcError> {
+    let invalid_response = |text: &'static str| BmcError::InvalidResponse {
+        url: response_url.clone(),
+        status,
+        text: text.to_string(),
+    };
+
+    let Some(value) = headers.get(header::LOCATION) else {
+        return Ok(None);
+    };
+
+    let raw = value
+        .to_str()
+        .map_err(|_| invalid_response("Location header is not valid text"))?;
+
+    let raw = raw.trim();
+
+    // Joining either value would resolve back to the response resource, which
+    // cannot identify a newly created session or asynchronous task monitor.
+    if raw.is_empty() || raw.starts_with('#') {
+        return Err(invalid_response(
+            "Location header does not identify a resource",
+        ));
+    }
+
+    let resolved = response_url
+        .join(raw)
+        .map_err(|_| invalid_response("Location header is not a valid URI reference"))?;
+
+    // Redfish follow-up requests carry BMC credentials. Reject another origin
+    // before reducing the URL to an OData path and losing that distinction.
+    if resolved.origin() != response_url.origin() {
+        return Err(invalid_response(
+            "Location header resolves to a different origin",
+        ));
+    }
+
+    let mut path_and_query = resolved.path().to_string();
+
+    // Preserve the query separately from the path so later polling or deletion
+    // sends it as a query instead of percent-encoded path text.
+    if let Some(query) = resolved.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+
+    Ok(Some(path_and_query.into()))
 }
 
 fn auth_token_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -1076,10 +1159,12 @@ mod tests {
     use super::*;
 
     use futures_util::io::Cursor;
+    use http::HeaderValue;
     use wiremock::matchers::header;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
     use wiremock::Mock;
+    use wiremock::MockBuilder;
     use wiremock::MockServer;
     use wiremock::Request;
     use wiremock::ResponseTemplate;
@@ -1091,6 +1176,34 @@ mod tests {
 
         #[serde(rename = "Targets")]
         targets: Vec<String>,
+    }
+
+    fn session_auth() -> (BmcCredentials, HeaderMap) {
+        let credentials = BmcCredentials::token("session-secret".to_string());
+        let mut headers = HeaderMap::new();
+
+        headers.insert(
+            "X-Custom-Secret",
+            http::HeaderValue::from_static("custom-secret"),
+        );
+
+        (credentials, headers)
+    }
+
+    fn credentialed_get(resource_path: &str) -> MockBuilder {
+        Mock::given(method("GET"))
+            .and(path(resource_path))
+            .and(header("X-Auth-Token", "session-secret"))
+            .and(header("X-Custom-Secret", "custom-secret"))
+    }
+
+    async fn mount_redirect(mock_server: &MockServer, source_path: &str, location: &str) {
+        Mock::given(method("GET"))
+            .and(path(source_path))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", location))
+            .expect(1)
+            .mount(mock_server)
+            .await;
     }
 
     #[test]
@@ -1113,6 +1226,155 @@ mod tests {
 
         let created_miss = BmcError::cache_miss();
         assert!(matches!(created_miss, BmcError::CacheMiss));
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_is_rejected_before_forwarding_credentials(
+    ) -> Result<(), Box<dyn StdError>> {
+        let source_server = MockServer::start().await;
+        let destination_server = MockServer::start().await;
+        let source_path = "/redfish/v1";
+        let destination_path = "/capture";
+        let destination_url = format!("{}{destination_path}", destination_server.uri());
+
+        mount_redirect(&source_server, source_path, &destination_url).await;
+
+        credentialed_get(destination_path)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&destination_server)
+            .await;
+
+        let client = Client::new()?;
+        let (credentials, headers) = session_auth();
+
+        let response = client
+            .get::<serde_json::Value>(
+                Url::parse(&format!("{}{source_path}", source_server.uri()))?,
+                &credentials,
+                None,
+                &headers,
+            )
+            .await;
+
+        assert!(matches!(
+            response,
+            Err(BmcError::ReqwestError(error)) if error.is_redirect()
+        ));
+
+        destination_server.verify().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirect_with_reqwest_default_policy_preserves_credentials(
+    ) -> Result<(), Box<dyn StdError>> {
+        let mock_server = MockServer::start().await;
+        let source_path = "/redfish/v1";
+        let destination_path = "/redfish/v1/redirected";
+
+        mount_redirect(&mock_server, source_path, destination_path).await;
+
+        credentialed_get(destination_path)
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "redirected": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut params = ClientParams::new();
+        params.max_redirects = None;
+
+        let client = Client::with_params(params)?;
+        let (credentials, headers) = session_auth();
+
+        let response: serde_json::Value = client
+            .get(
+                Url::parse(&format!("{}{source_path}", mock_server.uri()))?,
+                &credentials,
+                None,
+                &headers,
+            )
+            .await?;
+
+        assert_eq!(response["redirected"], true);
+        mock_server.verify().await;
+
+        Ok(())
+    }
+
+    #[test]
+    fn location_header_resolves_valid_and_rejects_invalid_references(
+    ) -> Result<(), Box<dyn StdError>> {
+        struct TestCase(&'static str, Result<&'static str, &'static str>);
+
+        let response_url = Url::parse("https://bmc.example/redfish/v1/SessionService/Sessions")?;
+
+        let cases = [
+            TestCase(
+                "https://bmc.example/redfish/v1/SessionService/Sessions/1?token=abc",
+                Ok("/redfish/v1/SessionService/Sessions/1?token=abc"),
+            ),
+            TestCase(
+                "/redfish/v1/SessionService/Sessions/1?token=abc",
+                Ok("/redfish/v1/SessionService/Sessions/1?token=abc"),
+            ),
+            TestCase(
+                "Sessions/1?token=abc",
+                Ok("/redfish/v1/SessionService/Sessions/1?token=abc"),
+            ),
+            TestCase(
+                "../TaskService/Tasks/42?token=abc",
+                Ok("/redfish/v1/TaskService/Tasks/42?token=abc"),
+            ),
+            TestCase(
+                "?token=abc",
+                Ok("/redfish/v1/SessionService/Sessions?token=abc"),
+            ),
+            TestCase(
+                "//bmc.example/redfish/v1/TaskService/Tasks/42",
+                Ok("/redfish/v1/TaskService/Tasks/42"),
+            ),
+            TestCase("", Err("Location header does not identify a resource")),
+            TestCase(
+                "#fragment",
+                Err("Location header does not identify a resource"),
+            ),
+            TestCase(
+                "https://other.example/redfish/v1/TaskService/Tasks/42",
+                Err("Location header resolves to a different origin"),
+            ),
+            TestCase(
+                "//bmc.example:8443/redfish/v1/TaskService/Tasks/42",
+                Err("Location header resolves to a different origin"),
+            ),
+            TestCase(
+                "//host:99999/path",
+                Err("Location header is not a valid URI reference"),
+            ),
+        ];
+
+        for TestCase(raw, expected) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::LOCATION, raw.parse::<HeaderValue>()?);
+
+            let result =
+                location_from_headers(&headers, &response_url, reqwest::StatusCode::CREATED);
+
+            match (result, expected) {
+                (Ok(Some(location)), Ok(expected)) => {
+                    assert_eq!(location.to_string(), expected, "{raw}");
+                }
+                (Err(BmcError::InvalidResponse { text, .. }), Err(expected)) => {
+                    assert_eq!(text, expected, "{raw}");
+                }
+                _ => return Err(format!("{raw}: unexpected Location result").into()),
+            }
+        }
+
+        Ok(())
     }
 
     /// Retry policy used in tests: retries GET requests on 503 responses.
@@ -1311,7 +1573,7 @@ mod tests {
             })
             .respond_with(
                 ResponseTemplate::new(202)
-                    .insert_header("Location", format!("https://bmc.example{task_path}"))
+                    .insert_header("Location", format!("{}{task_path}", mock_server.uri()))
                     .insert_header("Retry-After", "15"),
             )
             .expect(0)
@@ -1381,7 +1643,7 @@ mod tests {
             })
             .respond_with(
                 ResponseTemplate::new(202)
-                    .insert_header("Location", format!("https://bmc.example{task_path}"))
+                    .insert_header("Location", format!("{}{task_path}", mock_server.uri()))
                     .insert_header("Retry-After", "15"),
             )
             .expect(1)

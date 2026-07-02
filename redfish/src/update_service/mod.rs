@@ -23,21 +23,21 @@ mod software_inventory;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::Error;
-use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
-use crate::ServiceRoot;
 use crate::core::NavProperty;
 use crate::patch_support::Payload;
 use crate::patch_support::ReadPatchFn;
 use crate::schema::update_service::UpdateService as UpdateServiceSchema;
 use crate::schema::update_service::UpdateServiceSimpleUpdateAction;
+use crate::Error;
+use crate::NvBmc;
+use crate::Resource;
+use crate::ResourceSchema;
+use crate::ServiceRoot;
 
 use nv_redfish_core::Bmc;
 use nv_redfish_core::DataStream;
 #[cfg(feature = "update-service-deprecated")]
-use nv_redfish_core::EntityTypeRef;
+use nv_redfish_core::EntityTypeRef as _;
 #[cfg(feature = "update-service-deprecated")]
 use nv_redfish_core::HttpPushUriUpdateRequest;
 use nv_redfish_core::ModificationResponse;
