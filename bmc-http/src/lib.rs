@@ -579,7 +579,7 @@ where
         // The `etag` is always `None` when caching is disabled. Check the flag here so we can save
         // a read lock acquisition and guarantee that disabled caching never sends If-None-Match,
         // which could produce a 304 response without a cached body.
-        let etag = if self.cache_enabled {
+        let mut etag = if self.cache_enabled {
             let etags = self
                 .etags
                 .read()
@@ -589,7 +589,21 @@ where
         } else {
             None
         };
+        //We need to get cached body before the request unless it can be evicted during GET
+        //if cache reach the capacity.
+        let cached = if self.cache_enabled {
+            let mut cache = self
+                .cache
+                .write()
+                .map_err(|e| C::Error::cache_error(e.to_string()))?;
+            cache.get_typed::<Arc<T>>(&cache_key).cloned()
+        } else {
+            None
+        };
 
+        if cached.is_none() {
+            etag = None
+        }
         let credentials = self.read_credentials();
 
         // Perform GET request
@@ -634,14 +648,7 @@ where
             Err(e) => {
                 // Handle 304 Not Modified - return from cache
                 if e.is_cached() {
-                    let mut cache = self
-                        .cache
-                        .write()
-                        .map_err(|e| C::Error::cache_error(e.to_string()))?;
-                    cache
-                        .get_typed::<Arc<T>>(&cache_key)
-                        .cloned()
-                        .ok_or_else(C::Error::cache_miss)
+                    cached.ok_or_else(C::Error::cache_miss)
                 } else {
                     Err(e)
                 }
