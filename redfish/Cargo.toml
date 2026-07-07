@@ -127,6 +127,8 @@ serde_json = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
 tagged-types = { workspace = true }
+uuid = {workspace = true}
+tracing = {workspace = true}
 
 [build-dependencies]
 nv-redfish-csdl-compiler = { workspace = true }

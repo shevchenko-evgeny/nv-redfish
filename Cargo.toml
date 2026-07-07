@@ -62,6 +62,7 @@ nv-redfish = { version = "0.1", path = "./redfish" }
 nv-redfish-csdl-compiler = { version = "0.1", path = "./csdl-compiler" }
 nv-redfish-schema = { version = "0.1", path = "./schema" }
 toml = { version = "0.9", default-features = false }
+tracing = { version = "0.1.44"}
 
 # Dev
 tokio = "1"
