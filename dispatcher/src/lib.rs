@@ -46,8 +46,9 @@
 //! - [`Runtime`] + [`RuntimeConfig`], [`RuntimeHandle`] (with
 //!   [`RuntimeHandle::with_root`] / [`with_root_mut`][`RuntimeHandle::with_root_mut`]),
 //!   [`RuntimeOutput`], the [`FutureWork`] payload alias,
-//! - the [`schedulers`] module with the seven built-in branch primitives
-//!   ([`RoundRobin`], [`BoundedConcurrency`], [`CircuitBreaker`]),
+//! - the [`schedulers`] module with the built-in policy primitives
+//!   ([`RoundRobin`], [`StrictPriority`], [`BoundedConcurrency`],
+//!   [`CircuitBreaker`], [`TokenBucket`], [`FixedCost`], [`PeriodicLeaf`]),
 //! - optional out-of-band [`RuntimeEventType`].
 //!
 //! The runtime does *not* enumerate the scheduler tree, and exposes no
@@ -78,9 +79,6 @@
 // Module-name repetition is intentional for this crate's public types
 // (RuntimeOutput, RuntimeEvent, RuntimeStats, etc.) which are re-exported.
 #![allow(clippy::module_name_repetitions)]
-// Scaffold-only relaxations on the runtime surface that still has stubs.
-#![allow(clippy::unimplemented)]
-#![allow(dead_code)]
 
 pub mod event;
 pub mod runtime;
@@ -98,6 +96,8 @@ pub use event::RuntimeEventType;
 pub use runtime::ClockConfig;
 #[doc(inline)]
 pub use runtime::FutureWork;
+#[doc(inline)]
+pub use runtime::ManualClock;
 #[doc(inline)]
 pub use runtime::Runtime;
 #[doc(inline)]
@@ -137,5 +137,6 @@ pub use work::WorkMeta;
 
 #[doc(inline)]
 pub use schedulers::{
-    BoundedConcurrency, BreakerState, CircuitBreaker, CircuitBreakerConfig, RoundRobin,
+    BoundedConcurrency, BreakerState, CircuitBreaker, CircuitBreakerConfig, FixedCost,
+    PeriodicLeaf, RemovedChild, RoundRobin, StrictPriority, TokenBucket, TokenBucketConfig,
 };

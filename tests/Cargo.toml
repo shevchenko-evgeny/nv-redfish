@@ -29,6 +29,7 @@ nv-redfish = { workspace = true, features = [
     "controls",
     "computer-systems",
     "managers",
+    "manager-network-protocol",
     "oem-dell-attributes",
     "oem-ami",
     "oem-hpe",
@@ -37,11 +38,13 @@ nv-redfish = { workspace = true, features = [
     "oem-nvidia-baseboard",
     "oem-supermicro",
     "oem-liteon",
+    "oem-delta",
     "power-equipment",
     "power-supplies",
     "sensors",
     "session-service",
     "task-service",
+    "telemetry-service",
     "update-service",
 ] }
 serde = { workspace = true, features = ["derive"] }

@@ -17,6 +17,7 @@ members = [
    "examples/task-service",
    "examples/update-multipart",
    "dispatcher",
+   "dispatcher/sim",
    "tests"
 ]
 
@@ -54,6 +55,7 @@ url = { version = "2.5" }
 uuid = { version = "1.18", default-features = false }
 time = { version = "0.3", default-features = false }
 rust_decimal = { version = "1.38", default-features = false }
+rustc-hash = { version = "2" }
 nv-redfish-core = { version = "0.1", path = "./core" }
 nv-redfish-bmc-http = { version = "0.1", path = "./bmc-http" }
 nv-redfish-bmc-mock = { version = "0.1", path = "./bmc-mock" }
@@ -66,6 +68,7 @@ tracing = { version = "0.1.44"}
 
 # Dev
 tokio = "1"
+gungraun = "0.19.3"
 tokio-test = "0.4"
 # had to use 0.6.4 since it works with 2018 edition (2024 needs extra work) 
 wiremock = "0.6.4"
