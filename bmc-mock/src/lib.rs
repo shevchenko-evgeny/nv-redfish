@@ -187,6 +187,7 @@ where
                 response,
             } if id == *in_id => {
                 let response = response.map_err(|err| Error::ErrorResponse(Box::new(err)))?;
+                let response = nv_redfish_patch_inflight::patch_inflight(response);
                 let result: T = from_value(response).map_err(Error::BadResponseJson)?;
                 Ok(Arc::new(result))
             }
@@ -210,6 +211,7 @@ where
                 response,
             } if id == *in_id => {
                 let response = response.map_err(|err| Error::ErrorResponse(Box::new(err)))?;
+                let response = nv_redfish_patch_inflight::patch_inflight(response);
                 let result: T = from_value(response).map_err(Error::BadResponseJson)?;
                 Ok(Arc::new(result))
             }
