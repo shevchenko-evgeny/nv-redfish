@@ -153,13 +153,19 @@ where
 
 #[cfg(feature = "patch-inflight")]
 fn patch_inflight(mut v: Value) -> Value {
-    v = nv_redfish_patch_inflight::patch_inflight(v);
+    v = nv_redfish_patch_inflight::INFLIGHT_PATCH_REGISTRY.with_borrow(|r| {
+        if let Some(registry) = r.as_deref() {
+            registry.patch_inflight(v)
+        } else {
+            v
+        }
+    });
     v
 }
 
 #[cfg(not(feature = "patch-inflight"))]
 #[inline]
-fn patch_inflight(v: Value) -> Value {
+const fn patch_inflight(v: Value) -> Value {
     v
 }
 

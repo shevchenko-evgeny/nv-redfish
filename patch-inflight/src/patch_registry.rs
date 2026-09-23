@@ -13,46 +13,111 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::error::Error as StdError;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use regex::RegexSet;
 pub use serde_json::Value;
+use wildmatch::WildMatch;
+
+use crate::fixes::fix_ntp_null_elements;
+use crate::InflightPatchError;
 
 ///Function to transform JSON to correct RedFish object
 ///right before NavPropery deserialization
 pub type InflightPatchFn = Arc<dyn Fn(Value) -> Value + Sync + Send>;
 
-pub(crate) struct InflightPatch {
+pub struct ODataIdMatcher(WildMatch);
+
+impl From<&str> for ODataIdMatcher {
+    fn from(s: &str) -> Self {
+        Self(WildMatch::new(s))
+    }
+}
+
+impl ODataIdMatcher {
+    pub fn matches(&self, oid: &str) -> bool {
+        self.0.matches(oid)
+    }
+}
+
+pub struct InflightPatch {
     pub priority: usize,
-    pub oid_predicate: String,
+    pub name: String,
+    pub oid_predicate: ODataIdMatcher,
     pub patch: InflightPatchFn,
 }
 
-// impl InflightPatch {
-//     pub(crate) fn new(priority: usize, oid_predicate: &str, patch: InflightPatchFn) -> Self {
-//         Self { priority, oid_predicate: oid_predicate.to_string(),  patch }
-//     }
-// }
-#[derive(Default)]
 pub struct InflightPatchRegistry {
     patches: Vec<InflightPatch>,
-    regex_set: RegexSet,
+}
+
+impl Default for InflightPatchRegistry {
+    fn default() -> Self {
+        let mut patches = vec![];
+
+        let fix_ntp_null = InflightPatch {
+            priority: 1000,
+            name: "fix_ntp_null".into(),
+            oid_predicate: "/redfish/v1/Managers/*/NetworkProtocol".into(),
+            patch: Arc::new(fix_ntp_null_elements),
+        };
+        patches.push(fix_ntp_null);
+
+        match InflightPatchRegistry::new(patches) {
+            Ok(r) => r,
+            Err(_) => Self { patches: vec![] },
+        }
+    }
 }
 
 impl InflightPatchRegistry {
-    pub fn new(mut patches: Vec<InflightPatch>) -> Result<Self, Box<dyn StdError>> {
+    pub fn new(mut patches: Vec<InflightPatch>) -> Result<Self, InflightPatchError> {
+        let mut names = HashSet::with_capacity(patches.len());
+        for patch in &patches {
+            if !names.insert(patch.name.as_str()) {
+                return Err(InflightPatchError::DuplicationError(patch.name.clone()));
+            }
+        }
         patches.sort_by_key(|e| e.priority);
-        let expressions: Vec<&str> = patches.iter().map(|p| p.oid_predicate.as_str()).collect();
-        let regex_set = RegexSet::new(expressions)?;
-        Ok(Self { patches, regex_set })
+        Ok(Self { patches })
     }
 
-    pub fn patch(&self, oid: &str, json: Value) -> Value {
-        self.regex_set
-            .matches(oid)
-            .into_iter()
-            .map(|i| self.patches[i].patch.clone())
+    fn patch(&self, oid: &str, json: Value) -> Value {
+        self.patches
+            .iter()
+            .filter(|p| p.oid_predicate.matches(oid))
+            .map(|p| p.patch.clone())
             .fold(json, |i, f| f(i))
+    }
+
+    pub fn len(&self) -> usize {
+        self.patches.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patches.is_empty()
+    }
+
+    pub fn patch_inflight(&self, mut v: Value) -> Value {
+        let oid = v
+            .as_object()
+            .and_then(|o| o.get("@odata.id"))
+            .and_then(|s| s.as_str())
+            .map(str::to_owned);
+
+        if let Some(oid) = oid {
+            v = self.patch(&oid, v);
+        }
+        v
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::patch_registry::InflightPatchRegistry;
+
+    #[test]
+    fn test_default_registry_contains_elements() {
+        assert!(InflightPatchRegistry::default().len() > 0);
     }
 }

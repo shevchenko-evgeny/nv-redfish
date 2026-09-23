@@ -13,5 +13,4 @@ categories.workspace = true
 [dependencies]
 serde = { workspace = true, features = ["alloc", "derive"] }
 serde_json = { workspace = true, features = [ "std" ] }
-regex = { workspace = true }
-
+wildmatch.workspace = true

@@ -14,29 +14,30 @@
 // limitations under the License.
 
 pub(crate) mod fixes;
-pub(crate) mod patch_registry;
-use fixes::fix_ntp_null_elements;
-use patch_registry::{InflightPatch, InflightPatchRegistry};
-use serde_json::Value;
-use std::sync::{Arc, LazyLock};
+pub mod patch_registry;
+use std::cell::RefCell;
+use std::fmt::Display;
+use std::sync::Arc;
 
-pub(crate) static TRASFORMATOR: LazyLock<InflightPatchRegistry> = LazyLock::new(|| {
-    let fix_ntp_null = InflightPatch {
-        priority: 1000,
-        oid_predicate: r"^/redfish/v1/Managers/[^/]+/NetworkProtocol/?$".into(),
-        patch: Arc::new(fix_ntp_null_elements),
-    };
-    InflightPatchRegistry::new(vec![fix_ntp_null]).unwrap_or_default()});
+use crate::patch_registry::InflightPatchRegistry;
 
-pub fn patch_inflight(mut v: Value) -> Value {
-    let oid = v
-        .as_object()
-        .and_then(|o| o.get("@odata.id"))
-        .and_then(|s| s.as_str())
-        .map(str::to_owned);
-
-    if let Some(oid) = oid {
-        v = TRASFORMATOR.patch(&oid, v);
+/// Errors of patch inflight crate
+#[derive(Debug)]
+pub enum InflightPatchError {
+    /// Duplicated patch name
+    DuplicationError(String),
+}
+impl Display for InflightPatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InflightPatchError::DuplicationError(p) => {
+                write!(f, "Duplicated in-flight patch with name {p}")
+            }
+        }
     }
-    v
+}
+impl std::error::Error for InflightPatchError {}
+
+thread_local! {
+    pub static INFLIGHT_PATCH_REGISTRY: RefCell<Option<Arc<InflightPatchRegistry>>> = const { RefCell::new(None) };
 }

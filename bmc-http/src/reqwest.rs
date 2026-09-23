@@ -49,6 +49,8 @@ use nv_redfish_core::SessionCreateResponse;
 use nv_redfish_core::UploadReader;
 #[cfg(feature = "update-service-deprecated")]
 use nv_redfish_core::UploadStream;
+#[cfg(feature = "patch-inflight")]
+use nv_redfish_patch_inflight::{patch_registry::InflightPatchRegistry, INFLIGHT_PATCH_REGISTRY};
 use reqwest::multipart::Form;
 use reqwest::multipart::Part;
 use reqwest::redirect::Policy as RedirectPolicy;
@@ -689,19 +691,19 @@ impl Client {
     }
 }
 
-#[cfg(feature = "patch-inflight")]
-fn patch_inflight(mut v: serde_json::Value) -> serde_json::Value {
-    v = nv_redfish_patch_inflight::patch_inflight(v);
-    v
-}
-
-#[cfg(not(feature = "patch-inflight"))]
-#[inline]
-fn patch_inflight(v: serde_json::Value) -> serde_json::Value {
-    v
-}
-
 impl Client {
+    // #[cfg(feature = "patch-inflight")]
+    // fn patch_inflight(&self, mut v: serde_json::Value) -> serde_json::Value {
+    //     v = nv_redfish_patch_inflight::patch_inflight(v);
+    //     v
+    // }
+    //
+    // #[cfg(not(feature = "patch-inflight"))]
+    // #[inline]
+    // fn patch_inflight(&self, v: serde_json::Value) -> serde_json::Value {
+    //     v
+    // }
+
     /// Sends the request, retrying according to the configured [`RetryPolicy`].
     ///
     /// Transport errors are returned immediately. Requests with streaming
@@ -734,7 +736,11 @@ impl Client {
         }
     }
 
-    async fn handle_response<T>(&self, response: reqwest::Response) -> Result<T, BmcError>
+    async fn handle_response<T>(
+        &self,
+        response: reqwest::Response,
+        #[cfg(feature = "patch-inflight")] patch_registry: Option<Arc<InflightPatchRegistry>>,
+    ) -> Result<T, BmcError>
     where
         T: DeserializeOwned,
     {
@@ -751,13 +757,30 @@ impl Client {
         let etag_header = etag_from_headers(&headers);
 
         let mut value: serde_json::Value = response.json().await.map_err(BmcError::ReqwestError)?;
-        value = patch_inflight(value);
+
+        #[cfg(feature = "patch-inflight")]
+        {
+            INFLIGHT_PATCH_REGISTRY.with_borrow_mut(|r| {
+                r.clone_from(&patch_registry);
+            });
+
+            if let Some(registry) = patch_registry {
+                value = registry.patch_inflight(value);
+            }
+        }
 
         if let Some(etag) = etag_header {
             inject_etag(&etag, &mut value);
         }
 
-        serde_path_to_error::deserialize(value).map_err(BmcError::JsonError)
+        let result = serde_path_to_error::deserialize(value).map_err(BmcError::JsonError);
+        #[cfg(feature = "patch-inflight")]
+        {
+            INFLIGHT_PATCH_REGISTRY.with_borrow_mut(|r| {
+                *r = None;
+            });
+        }
+        result
     }
 
     async fn handle_modification_response<T>(
@@ -1092,6 +1115,8 @@ impl HttpClient for Client {
         credentials: &BmcCredentials,
         etag: Option<ODataETag>,
         custom_headers: &HeaderMap,
+
+        #[cfg(feature = "patch-inflight")] patch_registry: Option<Arc<InflightPatchRegistry>>,
     ) -> Result<T, Self::Error>
     where
         T: DeserializeOwned,
@@ -1104,7 +1129,13 @@ impl HttpClient for Client {
         }
 
         let response = self.send(request.build()?).await?;
-        self.handle_response(response).await
+
+        self.handle_response(
+            response,
+            #[cfg(feature = "patch-inflight")]
+            patch_registry,
+        )
+        .await
     }
 
     async fn post<B, T>(
@@ -1546,6 +1577,8 @@ mod tests {
                 &credentials,
                 None,
                 &headers,
+                #[cfg(feature = "patch-inflight")]
+                None,
             )
             .await;
 
@@ -1588,6 +1621,8 @@ mod tests {
                 &credentials,
                 None,
                 &headers,
+                #[cfg(feature = "patch-inflight")]
+                None,
             )
             .await?;
 
@@ -1722,6 +1757,8 @@ mod tests {
                 &credentials,
                 None,
                 &HeaderMap::new(),
+                #[cfg(feature = "patch-inflight")]
+                None,
             )
             .await?;
 
@@ -1783,6 +1820,8 @@ mod tests {
                 &credentials,
                 None,
                 &HeaderMap::new(),
+                #[cfg(feature = "patch-inflight")]
+                None,
             )
             .await?;
 
