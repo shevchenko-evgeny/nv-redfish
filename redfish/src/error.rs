@@ -85,6 +85,8 @@ pub enum Error<B: Bmc> {
     MetricReportDefinitionsNotAvailable,
     /// JSON parse error.
     Json(JsonError),
+    /// Missing feature error
+    MissingFeature(String),
 }
 
 impl<B: Bmc> Display for Error<B> {
@@ -156,6 +158,9 @@ impl<B: Bmc> Display for Error<B> {
             #[cfg(feature = "telemetry-service")]
             Self::MetricReportDefinitionsNotAvailable => {
                 write!(f, "Metric report definitions are not available")
+            },
+            Self::MissingFeature(feature) => {
+                write!(f, "Missing feature {feature}")
             }
         }
     }

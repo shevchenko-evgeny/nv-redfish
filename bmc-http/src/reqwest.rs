@@ -744,6 +744,18 @@ impl Client {
     }
 }
 
+#[cfg(feature = "patch-inflight")]
+fn patch_inflight(mut v: serde_json::Value) -> serde_json::Value {
+    v = nv_redfish_patch_inflight::patch_inflight(v);
+    v
+}
+
+#[cfg(not(feature = "patch-inflight"))]
+#[inline]
+fn patch_inflight(v: serde_json::Value) -> serde_json::Value {
+    v
+}
+
 impl Client {
     /// Sends the request, retrying according to the configured [`RetryPolicy`].
     ///
@@ -797,6 +809,7 @@ impl Client {
 
         let mut value: serde_json::Value =
             serde_json::from_slice(&body).map_err(BmcError::DecodeError)?;
+        value = patch_inflight(value);
 
         if let Some(etag) = etag_header {
             inject_etag(&etag, &mut value);

@@ -65,6 +65,62 @@ const SERIAL_INTERFACE_COLLECTION_DATA_TYPE: &str =
 const SERIAL_INTERFACE_DATA_TYPE: &str = "#SerialInterface.v1_1_8.SerialInterface";
 
 #[test]
+async fn manager_null_ntp_array() -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = ids();
+    let manager = get_manager(
+        bmc.clone(),
+        &ids,
+        manager_payload_with_fields(
+            &ids,
+            json!({ "NetworkProtocol": { ODATA_ID: &ids.manager_network_protocol_id } }),
+        ),
+    )
+    .await?;
+
+    bmc.expect(Expect::get(
+        &ids.manager_network_protocol_id,
+        json!({
+            ODATA_ID: &ids.manager_network_protocol_id,
+            ODATA_TYPE: MANAGER_NETWORK_PROTOCOL_DATA_TYPE,
+            "Id": "NetworkProtocol",
+            "Name": "Manager Network Protocol",
+            "NTP": {
+              "NTPServers": [null, null, null, null],
+              "ProtocolEnabled": false
+            }
+        }),
+    ));
+
+    let network_protocol = manager
+        .network_protocol()
+        .await?
+        .ok_or_else(|| std::io::Error::other("missing manager network protocol"))?;
+    let raw = network_protocol.raw();
+    let ntp_servers = raw
+        .ntp
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("missing ntp protocol"))?
+        .ntp_servers
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("missing ntp servers"))?
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("missing ntp servers"))?;
+
+    assert_eq!(
+        ntp_servers,
+        &vec![
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string()
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
 async fn network_protocol_returns_none_when_link_is_absent() -> Result<(), Box<dyn StdError>> {
     let bmc = Arc::new(Bmc::default());
     let ids = ids();
