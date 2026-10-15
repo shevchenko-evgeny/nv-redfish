@@ -14,7 +14,6 @@
 // limitations under the License.
 
 use crate::compiler::Action;
-use crate::compiler::ActionsMap;
 use crate::compiler::NavProperty;
 use crate::compiler::OData;
 use crate::compiler::Parameter;
@@ -26,6 +25,7 @@ use crate::compiler::QualifiedName;
 use crate::compiler::RigidArraySupport;
 use crate::generator::rust::doc::format_and_generate as doc_format_and_generate;
 use crate::generator::rust::doc::format_and_generate_with_deprecation as doc_format_deprecated;
+use crate::generator::rust::inherited_properties::InheritedProperties;
 use crate::generator::rust::ActionFullTypeName;
 use crate::generator::rust::ActionName;
 use crate::generator::rust::Config;
@@ -46,12 +46,13 @@ use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use quote::quote;
 use quote::ToTokens;
-use std::iter;
+use std::collections::HashSet;
+use std::iter::once;
 
 #[derive(Debug)]
-pub enum GenerateType {
+pub enum GenerateType<'a> {
     Read,
-    Excerpt(ExcerptCopy),
+    Excerpt(&'a ExcerptCopy),
     Update,
     Create,
     Action,
@@ -61,28 +62,14 @@ pub enum GenerateType {
 #[derive(Debug)]
 pub struct StructDef<'a> {
     pub name: TypeName<'a>,
-    base: Option<QualifiedName<'a>>,
-    properties: Properties<'a>,
-    parameters: Vec<Parameter<'a>>,
-    actions: ActionsMap<'a>,
+    properties: Vec<&'a Properties<'a>>,
+    parameters: &'a [Parameter<'a>],
+    actions: Vec<&'a Action<'a>>,
     odata: OData<'a>,
-    generate: Vec<GenerateType>,
+    generate: Vec<GenerateType<'a>>,
     create_type: Option<QualifiedName<'a>>,
-    // Today we implement settings resource using the same EntityType
-    // as we use for active resource (see DSP0266 9.10 Settings
-    // resource for terminology). In theory we can generate own type
-    // for Settings that excludes "ReadOnly, not required" fields and
-    // implements `@Redfish.SettingsApplyTime` instead of implementing
-    // it in active resource itself.
     need_redfish_settings: bool,
     dynamic_properties: Option<DynamicProperties<'a>>,
-}
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum ImplType {
-    Root,
-    Child,
-    None,
 }
 
 #[derive(Clone, Copy)]
@@ -121,72 +108,12 @@ impl<'a> StructDef<'a> {
 
     fn generate_read(&self, tokens: &mut TokenStream, config: &Config) {
         let top = &config.top_module_alias;
-        let mut content = TokenStream::new();
+        let mut content = self.read_fields(config);
         let odata_id = Ident::new("odata_id", Span::call_site());
         let odata_etag = Ident::new("odata_etag", Span::call_site());
-        let (base_props, impl_type) = self.base_type(&odata_id, &odata_etag, config);
 
-        // Properties token streams:
-        let properties_iter = self.properties.properties.iter().filter_map(|p| {
-            if p.odata.permissions_is_write_only() || p.redfish.is_excerpt_only.into_inner() {
-                None
-            } else {
-                Some(Self::generate_property(p, config))
-            }
-        });
-
-        // Navigation properties token streams:
-        let nav_properties_iter = self
-            .properties
-            .nav_properties
-            .iter()
-            .map(|p| Self::generate_nav_property(p, config));
-
-        // Action properties token streams:
-        let mut actions = self.actions.values().collect::<Vec<_>>();
-        actions.sort_by_key(|a| a.name);
-        let action_iter = actions
-            .iter()
-            .map(|a| Self::generate_action_property(a, config));
-
-        let additional_properties = if self.odata.additional_properties.is_some_and(|v| *v.inner())
-        {
-            // If additional_properties are explicitly set then we add
-            // placeholder with serde_json::Value to
-            // deserializer. Actually, it is almost always Oem /
-            // OemAction.
-            quote! {
-                #[serde(flatten)]
-                pub additional_properties: #top::AdditionalProperties,
-            }
-        } else {
-            // Add dynamic properties if no additional properties
-            // defined.
-            self.dynamic_properties
-                .map_or_else(
-                    TokenStream::new,
-                    |dynamic_properties| match dynamic_properties.ptype.as_str() {
-                        "Edm.PrimitiveType" => quote! {
-                            #[serde(flatten)]
-                            pub dynamic_properties: #top::DynamicProperties<#top::edm::PrimitiveType>,
-                        },
-                        "Edm.String" => quote! {
-                            #[serde(flatten)]
-                            pub dynamic_properties: #top::DynamicProperties<#top::edm::String>,
-                        },
-                        v => quote! { not_supported_type: compile_error!(#v) },
-                    },
-                )
-        };
-
-        // Combine all together in content
-        let all_properties = iter::once(base_props)
-            .chain(properties_iter)
-            .chain(nav_properties_iter)
-            .chain(action_iter)
-            .chain(iter::once(additional_properties));
-
-        content.extend(all_properties);
+        let additional_properties = self.additional_properties_field(config);
+        content.extend(additional_properties);
 
         let name = self.name;
 
@@ -194,18 +121,8 @@ impl<'a> StructDef<'a> {
             .serialize_read_models
             .then(|| quote! { #[derive(Serialize)] });
 
-        // Note: Manual implementation of Send and Sync is needed to
-        // help compiler. It goes through all properties deeper and
-        // deepr in the Redfish tree until it hits the recursion
-        // limit. Increasing recursion limit to 256 helps with the
-        // regular Redfish tree but it should be done client code on
-        // top level of module and this is sucks. We guarantee that
-        // all types inside tree are primitive (Strings, integers
-        // DateTimes) or entity reference wich can contain Arc but
-        // still they are Send and Sync.
-        //
-        // So, we create shortcut for compiler and state that we
-        // guarantee Send and Sync here and below.
+        // Explicit implementations avoid trait-solver recursion through the resource tree.
+        // Every generated field is composed of Send + Sync schema types and core wrappers.
         tokens.extend([
             doc_format_and_generate(self.name, &self.odata),
             quote! {
@@ -219,39 +136,90 @@ impl<'a> StructDef<'a> {
             },
         ]);
 
-        // Additional function that are implemented for type:
-        let entity_type_impl = |fn_id_impl, fn_etag_impl| {
-            quote! {
+        if self.odata.must_have_id.into_inner() {
+            tokens.extend(quote! {
                 impl #top::EntityTypeRef for #name {
-                    #[inline] fn odata_id(&self) -> &ODataId { #fn_id_impl }
-                    #[inline] fn etag(&self) -> Option<&ODataETag> { #fn_etag_impl }
+                    #[inline] fn odata_id(&self) -> &ODataId { &self.#odata_id }
+                    #[inline] fn etag(&self) -> Option<&ODataETag> { self.#odata_etag.as_ref() }
                 }
-            }
-        };
-
-        tokens.extend(match impl_type {
-            ImplType::Root => entity_type_impl(
-                quote! { &self.#odata_id },
-                quote! { self.#odata_etag.as_ref() },
-            ),
-            ImplType::Child => {
-                entity_type_impl(quote! { self.base.odata_id() }, quote! { self.base.etag() })
-            }
-            ImplType::None => TokenStream::new(),
-        });
-
-        if impl_type != ImplType::None {
-            self.generate_entity_type_traits(tokens, impl_type, config);
+            });
+            self.generate_entity_type_traits(tokens, config);
         }
 
-        if !actions.is_empty() {
+        if !self.actions.is_empty() {
             let mut content = TokenStream::new();
-            for a in &actions {
+            for a in &self.actions {
                 Self::generate_action_function(&mut content, a, config);
             }
             tokens.extend(quote! {
                 impl #name { #content }
             });
+        }
+    }
+
+    fn read_fields(&self, config: &Config) -> TokenStream {
+        // Properties token streams:
+        let properties_iter = self
+            .read_properties()
+            .map(|p| Self::generate_property(p, config));
+
+        // Navigation properties token streams:
+        let nav_properties_iter = self
+            .read_nav_properties()
+            .map(|p| Self::generate_nav_property(p, config));
+
+        // Action properties token streams:
+        let action_iter = self
+            .actions
+            .iter()
+            .map(|a| Self::generate_action_property(a, config));
+
+        once(self.metadata_fields(config))
+            .chain(properties_iter)
+            .chain(nav_properties_iter)
+            .chain(action_iter)
+            .collect()
+    }
+
+    fn read_properties(&self) -> impl Iterator<Item = &Property<'a>> {
+        self.properties
+            .iter()
+            .flat_map(|p| &p.properties)
+            .filter(|p| {
+                !p.odata.permissions_is_write_only() && !p.redfish.is_excerpt_only.into_inner()
+            })
+    }
+
+    fn read_nav_properties(&self) -> impl Iterator<Item = &NavProperty<'a>> {
+        self.properties
+            .iter()
+            .flat_map(|p| &p.nav_properties)
+            .filter(
+                |p| !matches!(p, NavProperty::Expandable(p) if p.odata.permissions_is_write_only()),
+            )
+    }
+
+    fn additional_properties_field(&self, config: &Config) -> TokenStream {
+        let top = &config.top_module_alias;
+        if self.odata.additional_properties.is_some_and(|v| *v.inner()) {
+            // If additional_properties are explicitly set then we add
+            // placeholder with serde_json::Value to
+            // deserializer. Actually, it is almost always Oem /
+            // OemAction.
+            quote! {
+                #[serde(flatten)]
+                pub additional_properties: #top::AdditionalProperties,
+            }
+        } else {
+            // Add dynamic properties if no additional properties
+            // defined.
+            self.dynamic_properties.map_or_else(TokenStream::new, |v| {
+                let dynamic_type = Self::dynamic_properties_type(v, config);
+                quote! {
+                    #[serde(flatten)]
+                    pub dynamic_properties: #dynamic_type,
+                }
+            })
         }
     }
 
@@ -262,18 +230,22 @@ impl<'a> StructDef<'a> {
         excerpt_copy: &ExcerptCopy,
     ) {
         let mut content = TokenStream::new();
-        let all_properties = self.properties.properties.iter().filter_map(|p| {
-            if !p.odata.permissions_is_write_only()
-                && p.redfish
-                    .excerpt
-                    .as_ref()
-                    .is_some_and(|excerpt| excerpt.matches(excerpt_copy))
-            {
-                Some(Self::generate_property(p, config))
-            } else {
-                None
-            }
-        });
+        let all_properties = self
+            .properties
+            .iter()
+            .flat_map(|p| &p.properties)
+            .filter_map(|p| {
+                if !p.odata.permissions_is_write_only()
+                    && p.redfish
+                        .excerpt
+                        .as_ref()
+                        .is_some_and(|excerpt| excerpt.matches(excerpt_copy))
+                {
+                    Some(Self::generate_property(p, config))
+                } else {
+                    None
+                }
+            });
 
         content.extend(all_properties);
 
@@ -290,88 +262,36 @@ impl<'a> StructDef<'a> {
         }]);
     }
 
-    fn base_type(
-        &self,
-        odata_id: &Ident,
-        odata_etag: &Ident,
-        config: &Config,
-    ) -> (TokenStream, ImplType) {
-        let maybe_odata_type = if *self.odata.must_have_type.inner() {
-            quote! {
-                /// Type of the resource
-                #[serde(rename="@odata.type")]
+    fn metadata_fields(&self, config: &Config) -> TokenStream {
+        let top = &config.top_module_alias;
+        let mut fields = TokenStream::new();
+        if self.odata.must_have_id.into_inner() {
+            fields.extend(quote! {
+                #[serde(rename = "@odata.id")]
+                pub odata_id: ODataId,
+                #[serde(rename = "@odata.etag", skip_serializing_if = "Option::is_none")]
+                pub odata_etag: Option<ODataETag>,
+            });
+        }
+        if self.odata.must_have_type.into_inner() {
+            fields.extend(quote! {
+                /// Type of the resource.
+                #[serde(rename = "@odata.type")]
                 pub odata_type: String,
-            }
-        } else {
-            quote! {}
-        };
-        self.base.map_or_else(
-            || {
-                if *self.odata.must_have_id.inner() {
-                    let top = &config.top_module_alias;
-                    // MustHaveId only for the root elements in type hierarchy. This requirements by code
-                    // generation. Generator needs to add @odata.id field to the struct.
-                    // If we will add odata.id on each level it may break deserialization.
-                    (
-                        quote! {
-                            #[serde(rename="@odata.id")]
-                            pub #odata_id: ODataId,
-                            #[serde(rename="@odata.etag", skip_serializing_if = "Option::is_none")]
-                            pub #odata_etag: Option<ODataETag>,
-                            #maybe_odata_type
-                            #[serde(rename = "@Redfish.Settings", skip_serializing_if = "Option::is_none")]
-                            pub redfish_settings: Option<#top::settings::Settings>,
-                            #[serde(rename = "@Redfish.SettingsApplyTime", skip_serializing_if = "Option::is_none")]
-                            pub redfish_settings_apply_type: Option<#top::settings::PreferredApplyTime>,
-                        },
-                        ImplType::Root,
-                    )
-                } else {
-                    (TokenStream::new(), ImplType::None)
-                }
-            },
-            |base| {
-                let base_pname = StructFieldName::new_property(&config.base_type_prop_name);
-                let typename = FullTypeName::new(base, config);
-                (
-                    quote! {
-                        #maybe_odata_type
-                        /// Base type
-                        #[serde(flatten)]
-                        pub #base_pname: #typename,
-                    },
-                    if *self.odata.must_have_id.inner() {
-                        ImplType::Child
-                    } else {
-                        ImplType::None
-                    },
-                )
-            },
-        )
+            });
+        }
+        if self.odata.must_have_id.into_inner() {
+            fields.extend(quote! {
+                /// Settings annotations.
+                #[serde(flatten)]
+                pub settings_annotations: #top::SettingsAnnotations,
+            });
+        }
+        fields
     }
 
     fn generate_update(&self, tokens: &mut TokenStream, config: &Config) {
-        let (base, base_impl) = self.base.map_or_else(
-            || (quote! {}, quote! {}),
-            |base| {
-                let typename = FullTypeName::new(base, config).for_update(None);
-                (
-                    quote! {
-                        #[serde(flatten)]
-                        pub base: Option<#typename>,
-                    },
-                    quote! {
-                       #[must_use]
-                       pub fn with_base(mut self, v: #typename) -> Self {
-                           self.base = Some(v);
-                           self
-                       }
-                    },
-                )
-            },
-        );
-
-        let properties = SerializableProperties::new(&self.properties, config);
+        let properties = SerializableProperties::for_update(&self.properties, config);
 
         let has_additional_properties =
             self.odata.additional_properties.is_some_and(|v| *v.inner());
@@ -387,7 +307,46 @@ impl<'a> StructDef<'a> {
         } else {
             TokenStream::new()
         };
+        let dynamic_properties_type = if has_additional_properties {
+            None
+        } else {
+            self.dynamic_properties
+                .map(|v| Self::dynamic_properties_type(v, config))
+        };
+        let dynamic_properties = dynamic_properties_type.as_ref().map(|dynamic_type| {
+            quote! {
+                #[serde(flatten)]
+                pub dynamic_properties: #dynamic_type,
+            }
+        });
+        let dynamic_properties_impl = dynamic_properties_type.as_ref().map(|dynamic_type| {
+            quote! {
+                #[must_use]
+                pub fn with_dynamic_properties(mut self, v: #dynamic_type) -> Self {
+                    self.dynamic_properties = v;
+                    self
+                }
+            }
+        });
 
+        let is_resource = self.odata.must_have_id.into_inner();
+        let top = &config.top_module_alias;
+        let settings_annotations = is_resource.then(|| {
+            quote! {
+                /// Settings annotations.
+                #[serde(flatten)]
+                pub settings_annotations: #top::SettingsUpdateAnnotations,
+            }
+        });
+        let settings_annotations_impl = is_resource.then(|| {
+            quote! {
+                #[must_use]
+                pub fn with_settings_apply_time(mut self, v: #top::SettingsApplyTimeUpdate) -> Self {
+                    self.settings_annotations.settings_apply_time = Some(v);
+                    self
+                }
+            }
+        });
         let content = properties.struct_content_for_update();
         let comment = format!(" Update struct corresponding to `{}`", self.name);
         let name = self.name.for_update(None);
@@ -395,14 +354,20 @@ impl<'a> StructDef<'a> {
             &name,
             &properties,
             SerializableStructKind::Update,
-            self.base.is_some(),
             has_additional_properties,
+            dynamic_properties_type.is_some(),
+            is_resource,
         );
         tokens.extend(quote! {
             #[doc = #comment]
             #[derive(Serialize, Default)]
             #debug_derive
-            pub struct #name { #base #content #additional_properties }
+            pub struct #name {
+                #content
+                #settings_annotations
+                #additional_properties
+                #dynamic_properties
+            }
         });
 
         let content = properties.optional_property_setter_for_update();
@@ -418,16 +383,30 @@ impl<'a> StructDef<'a> {
                 pub const fn build(self) -> Self {
                     self
                 }
-                #base_impl
                 #content
+                #settings_annotations_impl
+                #dynamic_properties_impl
             }
             #debug_impl
         });
     }
 
     fn generate_create(&self, tokens: &mut TokenStream, config: &Config) {
-        let properties = SerializableProperties::new(&self.properties, config);
-
+        let properties = SerializableProperties::for_create(&self.properties, config);
+        let has_additional_properties =
+            self.odata.additional_properties.is_some_and(|v| *v.inner());
+        let top = &config.top_module_alias;
+        let additional_properties = has_additional_properties.then(|| {
+            quote! {
+                #[serde(flatten)]
+                pub additional_properties: #top::AdditionalProperties,
+            }
+        });
+        let additional_properties_init = has_additional_properties.then(|| {
+            quote! {
+                additional_properties: #top::AdditionalProperties::default(),
+            }
+        });
         let content = properties.struct_content_for_create();
         let comment = format!(" Create struct corresponding to `{}`", self.name);
         let name = self.name.for_create();
@@ -435,6 +414,7 @@ impl<'a> StructDef<'a> {
             &name,
             &properties,
             SerializableStructKind::Create,
+            has_additional_properties,
             false,
             false,
         );
@@ -442,7 +422,7 @@ impl<'a> StructDef<'a> {
             #[doc = #comment]
             #[derive(Serialize)]
             #debug_derive
-            pub struct #name { #content }
+            pub struct #name { #content #additional_properties }
         }]);
 
         let prop_fn_content = properties.optional_property_setter_for_create();
@@ -456,6 +436,7 @@ impl<'a> StructDef<'a> {
                 pub fn builder(#builder_fn_arglist) -> Self {
                     Self {
                         #builder_fn_content
+                        #additional_properties_init
                     }
                 }
                 #[must_use]
@@ -472,12 +453,16 @@ impl<'a> StructDef<'a> {
         name: N,
         properties: &SerializableProperties<'a>,
         kind: SerializableStructKind,
-        has_base: bool,
         has_additional_properties: bool,
+        has_dynamic_properties: bool,
+        has_settings_annotations: bool,
     ) -> (TokenStream, TokenStream) {
-        // Additional properties contain arbitrary request values and have no schema metadata that
-        // can identify sensitive entries, so always use a redacting Debug implementation for them.
-        if properties.can_contain_sensitive_info() || has_additional_properties {
+        // Open properties contain arbitrary request values and have no schema metadata that can
+        // identify sensitive entries, so always use a redacting Debug implementation for them.
+        if properties.can_contain_sensitive_info()
+            || has_additional_properties
+            || has_dynamic_properties
+        {
             let mut fields = TokenStream::new();
             match kind {
                 SerializableStructKind::Update => {
@@ -491,20 +476,24 @@ impl<'a> StructDef<'a> {
                         .to_tokens(&mut fields);
                 }
             }
-            let base = has_base.then(|| quote! { .field("base", &self.base) });
             // Additional properties are arbitrary OEM-provided request values with no schema
             // metadata that can identify sensitive entries, so never expose their contents.
             let additional_properties = has_additional_properties
                 .then(|| quote! { .field("additional_properties", &"<redacted>") });
+            let dynamic_properties = has_dynamic_properties
+                .then(|| quote! { .field("dynamic_properties", &"<redacted>") });
+            let settings_annotations = has_settings_annotations
+                .then(|| quote! { .field("settings_annotations", &self.settings_annotations) });
             (
                 quote! {},
                 quote! {
                     impl core::fmt::Debug for #name {
                         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                             f.debug_struct(stringify!(#name))
-                                #base
                                 #fields
+                                #settings_annotations
                                 #additional_properties
+                                #dynamic_properties
                                 .finish()
                         }
                     }
@@ -516,6 +505,7 @@ impl<'a> StructDef<'a> {
     }
 
     fn generate_action(&self, tokens: &mut TokenStream, config: &Config) {
+        let top = &config.top_module_alias;
         let mut content = TokenStream::new();
         content.extend(
             self.parameters
@@ -532,7 +522,12 @@ impl<'a> StructDef<'a> {
             // sensitivity metadata. Do not derive Debug until those fields can be redacted.
             quote! {
                 #[derive(Serialize)]
-                pub struct #name { #content }
+                pub struct #name {
+                    /// Protocol annotations for this action request.
+                    #[serde(flatten)]
+                    pub redfish_annotations: #top::ActionAnnotations,
+                    #content
+                }
             },
         ]);
     }
@@ -548,9 +543,21 @@ impl<'a> StructDef<'a> {
             p.rigid_array_support,
         );
         let name = StructFieldName::new_property(p.name);
-        quote! {
-            #doc #serde
-            pub #name: #field_type,
+        quote! { #doc #serde pub #name: #field_type, }
+    }
+
+    /// Returns the generated Rust map type for Redfish dynamic properties.
+    fn dynamic_properties_type(
+        dynamic_properties: DynamicProperties<'_>,
+        config: &Config,
+    ) -> TokenStream {
+        let top = &config.top_module_alias;
+        match dynamic_properties.ptype.as_str() {
+            "Edm.PrimitiveType" => {
+                quote! { #top::DynamicProperties<#top::edm::PrimitiveType> }
+            }
+            "Edm.String" => quote! { #top::DynamicProperties<#top::edm::String> },
+            value => quote! { compile_error!(#value) },
         }
     }
 
@@ -645,9 +652,6 @@ impl<'a> StructDef<'a> {
         let rename = Literal::string(p.name().inner().inner());
         let (doc, serde, prop_type) = match p {
             NavProperty::Expandable(p) => {
-                if p.odata.permissions_is_write_only() {
-                    return TokenStream::new();
-                }
                 let doc = doc_format_deprecated(p.ptype.name(), &p.odata, p.redfish.deprecation);
                 let ptype = p.redfish.excerpt_copy.as_ref().map_or_else(
                     || {
@@ -677,10 +681,9 @@ impl<'a> StructDef<'a> {
             } => {
                 let doc = doc_format_deprecated(cardinality.inner(), odata, redfish.deprecation);
                 let top = &config.top_module_alias;
-                let ptype = quote! { #top::ReferenceLeaf };
                 let (sa, t) = Self::gen_de_struct_field(
                     cardinality,
-                    ptype,
+                    quote! { #top::ReferenceLeaf },
                     rename,
                     IsNullable::new(false),
                     IsRequired::new(false),
@@ -689,11 +692,7 @@ impl<'a> StructDef<'a> {
                 (doc, sa, t)
             }
         };
-        quote! {
-            #doc
-            #serde
-            pub #name: #prop_type,
-        }
+        quote! { #doc #serde pub #name: #prop_type, }
     }
 
     fn generate_action_parameter(p: &Parameter<'_>, config: &Config) -> TokenStream {
@@ -713,13 +712,12 @@ impl<'a> StructDef<'a> {
             }
             ParameterType::Entity(e) => {
                 let top = &config.top_module_alias;
-                Self::gen_action_parameter_field(
-                    &e,
-                    quote! { #top::Reference },
-                    &rename,
-                    p.nullable,
-                    p.required,
-                )
+                let field_type = if p.odata.is_url {
+                    quote! { #top::edm::String }
+                } else {
+                    quote! { #top::Reference }
+                };
+                Self::gen_action_parameter_field(&e, field_type, &rename, p.nullable, p.required)
             }
         };
         let serde = field.serde_annotation;
@@ -809,32 +807,12 @@ impl<'a> StructDef<'a> {
         }
     }
 
-    fn generate_entity_type_traits(
-        &self,
-        tokens: &mut TokenStream,
-        impl_type: ImplType,
-        config: &Config,
-    ) {
+    fn generate_entity_type_traits(&self, tokens: &mut TokenStream, config: &Config) {
         let name = self.name;
         let top = &config.top_module_alias;
         tokens.extend(quote! {
             impl #top::Expandable for #name {}
         });
-        let fn_settings_impl = match impl_type {
-            ImplType::Root => {
-                quote! {
-                    self.redfish_settings
-                        .as_ref()
-                        .and_then(|s| s.settings_object.as_ref())
-                        .map(|r| NavProperty::Reference(r.into()))
-                }
-            }
-            ImplType::Child => {
-                quote! { self.base.settings_object().map(|s| s.downcast::<Self>()) }
-            }
-            ImplType::None => TokenStream::new(),
-        };
-
         let update_name = self.name.for_update(None);
         if self.odata.updatable.is_some_and(|v| v.inner().value) {
             tokens.extend(quote! {
@@ -844,11 +822,16 @@ impl<'a> StructDef<'a> {
         if self.need_redfish_settings {
             tokens.extend(quote! {
                 impl #top::RedfishSettings<Self> for #name {
-                    #[inline] fn settings_object(&self) -> Option<NavProperty<Self>> { #fn_settings_impl }
+                    #[inline]
+                    fn settings_object(&self) -> Option<NavProperty<Self>> {
+                        self.settings_annotations.settings
+                            .as_ref()
+                            .and_then(|s| s.settings_object.as_ref())
+                            .map(|r| NavProperty::Reference(r.into()))
+                    }
                 }
             });
         }
-
         if self.odata.deletable.is_some_and(|v| v.inner().value) {
             tokens.extend(quote! {
                 impl #top::Deletable for #name {}
@@ -909,7 +892,11 @@ impl<'a> StructDef<'a> {
                         )
                     }
                     ParameterType::Entity(e) => {
-                        let full_type = quote! { #top::Reference };
+                        let full_type = if p.odata.is_url {
+                            quote! { #top::edm::String }
+                        } else {
+                            quote! { #top::Reference }
+                        };
                         Self::gen_de_struct_field_type(
                             &e,
                             full_type,
@@ -931,6 +918,7 @@ impl<'a> StructDef<'a> {
                     {
                         if let Some(a) = &self.#name  {
                             a.run(bmc, &#typename {
+                                redfish_annotations: #top::ActionAnnotations::default(),
                                 #params
                             }).await
                         } else {
@@ -967,10 +955,9 @@ impl<'a> StructDefBuilder<'a> {
     fn new(name: TypeName<'a>, odata: OData<'a>) -> Self {
         Self(StructDef {
             name,
-            base: None,
-            properties: Properties::default(),
-            parameters: Vec::default(),
-            actions: ActionsMap::default(),
+            properties: Vec::new(),
+            parameters: &[],
+            actions: Vec::new(),
             odata,
             generate: vec![GenerateType::Read],
             create_type: None,
@@ -979,30 +966,20 @@ impl<'a> StructDefBuilder<'a> {
         })
     }
 
-    /// Setup base struct name for the struct.
+    /// Include inherited fields directly in each generated model.
     #[must_use]
-    pub const fn with_base(mut self, base: QualifiedName<'a>) -> Self {
-        self.0.base = Some(base);
-        self
-    }
-
-    /// Setup action proprties for the struct.
-    #[must_use]
-    pub fn with_actions(mut self, actions: ActionsMap<'a>) -> Self {
-        self.0.actions = actions;
-        self
-    }
-
-    /// Setup structural and navigation proprties for the struct.
-    #[must_use]
-    pub fn with_properties(mut self, properties: Properties<'a>) -> Self {
-        self.0.properties = properties;
+    pub fn with_inherited_properties(mut self, inherited: InheritedProperties<'a>) -> Self {
+        self.0.properties = inherited.properties;
+        self.0.actions = inherited.actions;
+        self.0.odata.must_have_type = inherited.must_have_type;
+        self.0.odata.additional_properties = inherited.additional_properties;
+        self.0.dynamic_properties = inherited.dynamic_properties;
         self
     }
 
     /// Setup parameters for the struct (for action structs).
     #[must_use]
-    pub fn with_parameters(mut self, parameters: Vec<Parameter<'a>>) -> Self {
+    pub const fn with_parameters(mut self, parameters: &'a [Parameter<'a>]) -> Self {
         self.0.parameters = parameters;
         self
     }
@@ -1016,12 +993,12 @@ impl<'a> StructDefBuilder<'a> {
 
     /// Setup generation types for the struct.
     #[must_use]
-    pub fn with_generate_type(mut self, generate: Vec<GenerateType>) -> Self {
+    pub fn with_generate_type(mut self, generate: Vec<GenerateType<'a>>) -> Self {
         self.0.generate = generate;
         self
     }
 
-    /// Generation of `RedfishSettings` trait implementation.
+    /// Generate the typed settings resource accessor.
     #[must_use]
     pub const fn with_redfish_settings(mut self) -> Self {
         self.0.need_redfish_settings = true;
@@ -1039,19 +1016,17 @@ impl<'a> StructDefBuilder<'a> {
     ///
     /// Returns error if struct definition cannot be generated by the
     /// provided parameters.
-    pub fn build(self, config: &Config) -> Result<StructDef<'a>, Error<'a>> {
-        if self.0.base.is_some() {
-            let base_pname = StructFieldName::new_property(&config.base_type_prop_name);
-            for p in &self.0.properties.properties {
-                let pname = StructFieldName::new_property(p.name);
-                if base_pname == pname {
-                    return Err(Error::BaseTypeConflict);
-                }
-            }
-            for p in &self.0.properties.nav_properties {
-                let pname = StructFieldName::new_property(p.name());
-                if base_pname == pname {
-                    return Err(Error::BaseTypeConflict);
+    pub fn build(self, _config: &Config) -> Result<StructDef<'a>, Error<'a>> {
+        let mut names = HashSet::new();
+        for properties in &self.0.properties {
+            for name in properties
+                .properties
+                .iter()
+                .map(|p| p.name)
+                .chain(properties.nav_properties.iter().map(NavProperty::name))
+            {
+                if !names.insert(StructFieldName::new_property(name)) {
+                    return Err(Error::NameConflict);
                 }
             }
         }

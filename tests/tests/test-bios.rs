@@ -14,16 +14,23 @@
 // limitations under the License.
 //! Integration tests of BIOS support.
 
+use nv_redfish::computer_system::AttributesUpdate;
 use nv_redfish::computer_system::Bios;
+use nv_redfish::computer_system::BiosUpdate;
 use nv_redfish::computer_system::ComputerSystem;
+use nv_redfish::oem::hpe::schema::hpe_server_boot_settings::HpeServerBootSettingsUpdate;
+use nv_redfish::schema::settings::ApplyTime;
+use nv_redfish::schema::SettingsApplyTimeUpdate;
 use nv_redfish::ServiceRoot;
 use nv_redfish_core::EdmPrimitiveType;
+use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::ODataId;
 use nv_redfish_tests::Bmc;
 use nv_redfish_tests::Expect;
 use nv_redfish_tests::ODATA_ID;
 use nv_redfish_tests::ODATA_TYPE;
 use serde_json::json;
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
 use tokio::test;
@@ -31,6 +38,61 @@ use tokio::test;
 const SERVICE_ROOT_DATA_TYPE: &str = "#ServiceRoot.v1_13_0.ServiceRoot";
 const COMPUTER_SYSTEM_DATA_TYPE: &str = "#ComputerSystem.v1_20_1.ComputerSystem";
 const BIOS_DATA_TYPE: &str = "#Bios.v1_2_1.Bios";
+const HPE_BIOS_DATA_TYPE: &str = "#HpeBiosExt.v2_0_1.HpeBiosExt";
+const HPE_BOOT_DATA_TYPE: &str = "#HpeServerBootSettings.v2_0_0.HpeServerBootSettings";
+
+#[test]
+async fn bios_dynamic_attribute_update_serializes_and_redacts_debug() {
+    const SECRET: &str = "bios-secret-sentinel";
+
+    let values = HashMap::from([
+        (
+            "BootMode".to_string(),
+            Some(EdmPrimitiveType::String("Uefi".to_string())),
+        ),
+        (
+            "SetupPassword".to_string(),
+            Some(EdmPrimitiveType::String(SECRET.to_string())),
+        ),
+    ]);
+    let update = BiosUpdate::builder()
+        .with_attributes(
+            AttributesUpdate::builder()
+                .with_dynamic_properties(values)
+                .build(),
+        )
+        .build();
+
+    assert_eq!(
+        serde_json::to_value(&update).expect("BIOS update must serialize"),
+        json!({
+            "Attributes": {
+                "BootMode": "Uefi",
+                "SetupPassword": SECRET,
+            }
+        })
+    );
+    let debug = format!("{update:?}");
+    assert!(!debug.contains(SECRET));
+    assert!(debug.contains("dynamic_properties: \"<redacted>\""));
+}
+
+#[test]
+async fn bios_update_serializes_settings_apply_time() {
+    let update = bios_update("BootMode", "Uefi").with_settings_apply_time(
+        SettingsApplyTimeUpdate::builder()
+            .with_apply_time(ApplyTime::OnReset)
+            .build(),
+    );
+
+    assert_eq!(
+        serde_json::to_value(&update).expect("BIOS update must serialize"),
+        json!({
+            "Attributes": { "BootMode": "Uefi" },
+            "@Redfish.SettingsApplyTime": { "ApplyTime": "OnReset" }
+        })
+    );
+}
 
 // Test 1: basic BIOS retrieval via bios() and EdmPrimitiveType mapping.
 #[test]
@@ -167,6 +229,321 @@ async fn bios_missing_or_empty_attributes() -> Result<(), Box<dyn StdError>> {
     assert!(bios_empty_attrs.attribute("Anything").is_none());
 
     Ok(())
+}
+
+#[test]
+async fn bios_update_uses_live_resource_and_preserves_entity() -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = bios_ids();
+    let system = get_computer_system(bmc.clone(), &ids, "Generic").await?;
+    bmc.expect(Expect::get(
+        &ids.bios_id,
+        bios_payload(
+            &ids.bios_id,
+            json!({ "Attributes": { "BootMode": "Legacy" } }),
+        ),
+    ));
+    let bios = system.bios().await?.ok_or("BIOS missing")?;
+    let update = bios_update("BootMode", "Uefi");
+
+    bmc.expect(Expect::update(
+        &ids.bios_id,
+        json!({ "Attributes": { "BootMode": "Uefi" } }),
+        bios_payload(
+            &ids.bios_id,
+            json!({ "Attributes": { "BootMode": "Uefi" } }),
+        ),
+    ));
+
+    let ModificationResponse::Entity(updated) = bios.update(&update).await? else {
+        return Err("expected BIOS entity response".into());
+    };
+    let boot_mode = updated
+        .attribute("BootMode")
+        .ok_or("updated BootMode missing")?;
+    assert_eq!(boot_mode.str_value(), Some("Uefi"));
+    Ok(())
+}
+
+#[test]
+async fn bios_settings_uses_advertised_reference_and_handles_absence(
+) -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = bios_ids();
+    let settings_id = format!("{}/Settings", ids.bios_id);
+    let system = get_computer_system(bmc.clone(), &ids, "Generic").await?;
+    bmc.expect(Expect::get(
+        &ids.bios_id,
+        bios_payload(
+            &ids.bios_id,
+            json!({
+                "@Redfish.Settings": {
+                    "SettingsObject": { ODATA_ID: &settings_id }
+                }
+            }),
+        ),
+    ));
+    let bios = system.bios().await?.ok_or("BIOS missing")?;
+
+    let settings_etag = "W/\"bios-settings\"";
+    bmc.expect(Expect::get(
+        &settings_id,
+        bios_payload(
+            &settings_id,
+            json!({ "@odata.etag": settings_etag, "Attributes": {} }),
+        ),
+    ));
+    let settings = bios.settings().await?.ok_or("BIOS settings missing")?;
+    let update = bios_update("BootMode", "Uefi");
+    bmc.expect(Expect::update(
+        &settings_id,
+        json!({ "Attributes": { "BootMode": "Uefi" } }),
+        json!({ ODATA_ID: &settings_id }),
+    ));
+    bmc.expect(Expect::get(
+        &settings_id,
+        bios_payload(
+            &settings_id,
+            json!({ "Attributes": { "BootMode": "Uefi" } }),
+        ),
+    ));
+
+    assert!(matches!(
+        settings.update(&update).await?,
+        ModificationResponse::Entity(_)
+    ));
+
+    let system = get_computer_system(bmc.clone(), &ids, "Generic").await?;
+    bmc.expect(Expect::get(
+        &ids.bios_id,
+        bios_payload(&ids.bios_id, json!({})),
+    ));
+    let bios = system.bios().await?.ok_or("BIOS missing")?;
+    assert!(bios.settings().await?.is_none());
+    Ok(())
+}
+
+#[test]
+async fn bios_actions_use_advertised_targets() -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = bios_ids();
+    let reset_target = format!("{}/Actions/Bios.ResetBios", ids.bios_id);
+    let password_target = format!("{}/Actions/Bios.ChangePassword", ids.bios_id);
+    let system = get_computer_system(bmc.clone(), &ids, "Lenovo").await?;
+    bmc.expect(Expect::get(
+        &ids.bios_id,
+        bios_payload(
+            &ids.bios_id,
+            json!({
+                "Actions": {
+                    "#Bios.ResetBios": {
+                        "target": &reset_target,
+                        "title": "ResetBios"
+                    },
+                    "#Bios.ChangePassword": {
+                        "target": &password_target,
+                        "title": "ChangePassword"
+                    }
+                }
+            }),
+        ),
+    ));
+    let bios = system.bios().await?.ok_or("BIOS missing")?;
+
+    bmc.expect(Expect::action(&reset_target, json!({}), json!(null)));
+    assert!(matches!(
+        bios.reset().await?,
+        ModificationResponse::Entity(())
+    ));
+
+    bmc.expect(Expect::action(
+        &password_target,
+        json!({
+            "PasswordName": "UefiAdminPassword",
+            "OldPassword": "old-secret",
+            "NewPassword": "new-secret"
+        }),
+        json!(null),
+    ));
+    assert!(matches!(
+        bios.change_password(
+            "UefiAdminPassword".into(),
+            Some("old-secret".into()),
+            "new-secret".into(),
+        )
+        .await?,
+        ModificationResponse::Entity(())
+    ));
+    Ok(())
+}
+
+#[test]
+async fn bios_actions_must_be_advertised() -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = bios_ids();
+    let system = get_computer_system(bmc.clone(), &ids, "Lenovo").await?;
+    bmc.expect(Expect::get(
+        &ids.bios_id,
+        bios_payload(&ids.bios_id, json!({ "Actions": {} })),
+    ));
+    let bios = system.bios().await?.ok_or("BIOS missing")?;
+
+    assert!(matches!(
+        bios.reset().await,
+        Err(nv_redfish::Error::ActionNotAvailable)
+    ));
+    assert!(matches!(
+        bios.change_password(
+            "UefiAdminPassword".into(),
+            Some("old-secret".into()),
+            "new-secret".into(),
+        )
+        .await,
+        Err(nv_redfish::Error::ActionNotAvailable)
+    ));
+    Ok(())
+}
+
+#[test]
+async fn hpe_ilo6_boot_settings_follow_advertised_oem_link() -> Result<(), Box<dyn StdError>> {
+    hpe_boot_settings_follow_advertised_links("oem/hpe/boot").await
+}
+
+#[test]
+async fn hpe_ilo7_boot_settings_follow_advertised_oem_link() -> Result<(), Box<dyn StdError>> {
+    hpe_boot_settings_follow_advertised_links("boot").await
+}
+
+async fn hpe_boot_settings_follow_advertised_links(
+    boot_path: &str,
+) -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = bios_ids();
+    let current_id = format!("{}/{boot_path}", ids.bios_id);
+    let settings_id = format!("{current_id}/settings");
+    let system = get_computer_system(bmc.clone(), &ids, "HPE").await?;
+
+    bmc.expect(Expect::get(
+        &ids.bios_id,
+        bios_payload(
+            &ids.bios_id,
+            json!({
+                "Oem": {
+                    "Hpe": {
+                        ODATA_TYPE: HPE_BIOS_DATA_TYPE,
+                        "Links": {
+                            "Boot": { ODATA_ID: &current_id }
+                        }
+                    }
+                }
+            }),
+        ),
+    ));
+    let bios = system.bios().await?.ok_or("BIOS missing")?;
+    let hpe = bios.oem_hpe()?.ok_or("HPE BIOS extension missing")?;
+
+    let initial_order = vec![
+        "NIC.BootOption.Boot0000".to_string(),
+        "HD.BootOption.Boot0001".to_string(),
+    ];
+    bmc.expect(Expect::get(
+        &current_id,
+        hpe_boot_payload(
+            &current_id,
+            json!({
+                "@Redfish.Settings": {
+                    "SettingsObject": { ODATA_ID: &settings_id }
+                },
+                "PersistentBootConfigOrder": &initial_order
+            }),
+        ),
+    ));
+    let current = hpe.boot_settings().await?.ok_or("HPE boot link missing")?;
+    assert_eq!(
+        current.persistent_boot_config_order(),
+        Some(initial_order.as_slice())
+    );
+
+    bmc.expect(Expect::get(
+        &settings_id,
+        hpe_boot_payload(
+            &settings_id,
+            json!({
+                "@odata.etag": "W/\"hpe-boot-settings\"",
+                "PersistentBootConfigOrder": &initial_order
+            }),
+        ),
+    ));
+    let settings = current
+        .settings()
+        .await?
+        .ok_or("HPE pending boot settings missing")?;
+
+    let updated_order = vec![
+        "HD.BootOption.Boot0001".to_string(),
+        "NIC.BootOption.Boot0000".to_string(),
+    ];
+    let update = HpeServerBootSettingsUpdate::builder()
+        .with_persistent_boot_config_order(updated_order.clone())
+        .build();
+    bmc.expect(Expect::update(
+        &settings_id,
+        json!({ "PersistentBootConfigOrder": &updated_order }),
+        json!({ ODATA_ID: &settings_id }),
+    ));
+    bmc.expect(Expect::get(
+        &settings_id,
+        hpe_boot_payload(
+            &settings_id,
+            json!({ "PersistentBootConfigOrder": &updated_order }),
+        ),
+    ));
+
+    let ModificationResponse::Entity(updated) = settings.update(&update).await? else {
+        return Err("expected HPE boot-settings entity response".into());
+    };
+    assert_eq!(
+        updated.persistent_boot_config_order(),
+        Some(updated_order.as_slice())
+    );
+    Ok(())
+}
+
+fn bios_update(name: &str, value: &str) -> BiosUpdate {
+    BiosUpdate::builder()
+        .with_attributes(
+            AttributesUpdate::builder()
+                .with_dynamic_properties(HashMap::from([(
+                    name.to_string(),
+                    Some(EdmPrimitiveType::String(value.to_string())),
+                )]))
+                .build(),
+        )
+        .build()
+}
+
+fn bios_payload(id: &str, fields: serde_json::Value) -> serde_json::Value {
+    nv_redfish_tests::json_merge([
+        &json!({
+            ODATA_ID: id,
+            ODATA_TYPE: BIOS_DATA_TYPE,
+            "Id": "Bios",
+            "Name": "BIOS Settings",
+        }),
+        &fields,
+    ])
+}
+
+fn hpe_boot_payload(id: &str, fields: serde_json::Value) -> serde_json::Value {
+    nv_redfish_tests::json_merge([
+        &json!({
+            ODATA_ID: id,
+            ODATA_TYPE: HPE_BOOT_DATA_TYPE,
+            "Id": "boot",
+            "Name": "Boot Settings",
+        }),
+        &fields,
+    ])
 }
 
 struct BiosIds {

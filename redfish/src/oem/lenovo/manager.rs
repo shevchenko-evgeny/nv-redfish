@@ -15,24 +15,34 @@
 
 //! Support Lenovo Manager OEM extension.
 
+use crate::manager::Manager;
+use crate::oem::lenovo::oem_update;
 use crate::oem::lenovo::schema::lenovo_manager::v0_1_0::LenovoManagerProperties as LenovoManagerV0_1Schema;
+use crate::oem::lenovo::schema::lenovo_manager::v0_1_0::LenovoManagerPropertiesUpdate as LenovoManagerV0_1Update;
 use crate::oem::lenovo::schema::lenovo_manager::v1_0_0::LenovoManagerProperties as LenovoManagerV1_0Schema;
-use crate::oem::lenovo::schema::lenovo_manager::LenovoManagerProperties as LenovoManagerPropertiesSchema;
+use crate::oem::lenovo::schema::lenovo_manager::v1_0_0::LenovoManagerPropertiesUpdate as LenovoManagerV1_0Update;
 use crate::oem::lenovo::security_service::LenovoSecurityService;
 use crate::oem::oem_object;
 use crate::schema::manager::Manager as ManagerSchema;
+use crate::schema::manager::ManagerUpdate;
 use crate::Error;
 use crate::NvBmc;
 use nv_redfish_core::Bmc;
+use nv_redfish_core::EntityTypeRef as _;
+use nv_redfish_core::ModificationResponse;
+use nv_redfish_core::NavProperty;
+use nv_redfish_core::ODataETag;
+use nv_redfish_core::ODataId;
 use serde::Deserialize;
 use std::sync::Arc;
 
 #[doc(inline)]
 pub use crate::oem::lenovo::schema::lenovo_manager::KcsState;
 
-/// Lenovo has not incompatible schemas. One contains KCSEnabled as
-/// boolean, another contains KCSEnabled as string with
-/// Enabled/Disabled state.
+/// Lenovo uses incompatible representations of `KCSEnabled`.
+///
+/// One representation is Boolean and the other is an Enabled/Disabled
+/// string state.
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum LenovoManagerSchema {
@@ -42,12 +52,14 @@ pub enum LenovoManagerSchema {
     V1_0(LenovoManagerV1_0Schema),
 }
 
-/// Represents a Lenovo OEM exstension to Manager schema.
+/// Represents a Lenovo OEM extension to the Manager schema.
 ///
 /// Provides access to system information and sub-resources such as processors.
 pub struct LenovoManager<B: Bmc> {
     bmc: NvBmc<B>,
     data: Arc<LenovoManagerSchema>,
+    manager_etag: Option<ODataETag>,
+    manager_id: ODataId,
 }
 
 impl<B: Bmc> LenovoManager<B> {
@@ -60,14 +72,14 @@ impl<B: Bmc> LenovoManager<B> {
     /// Returns an error if parsing Lenovo manager OEM data fails.
     pub(crate) fn new(bmc: &NvBmc<B>, manager: &ManagerSchema) -> Result<Option<Self>, Error<B>> {
         Ok(manager
-            .base
-            .base
             .oem
             .as_ref()
             .map_or_else(|| Ok(None), |oem| oem_object(oem, "Lenovo"))?
             .map(|data| Self {
                 data,
                 bmc: bmc.clone(),
+                manager_etag: manager.etag().cloned(),
+                manager_id: manager.odata_id().clone(),
             }))
     }
 
@@ -95,6 +107,55 @@ impl<B: Bmc> LenovoManager<B> {
         }
     }
 
+    /// Enable or disable host-side IPMI access over KCS.
+    ///
+    /// The request representation follows the Boolean or string form exposed
+    /// by this manager. Returns `Ok(None)` when the current representation is
+    /// absent or null and therefore cannot be selected safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OEM update cannot be serialized or if updating
+    /// or fetching the returned manager fails.
+    pub async fn set_kcs_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<Option<ModificationResponse<Manager<B>>>, Error<B>> {
+        let oem = match self.data.as_ref() {
+            LenovoManagerSchema::V0_1(data) if data.kcs_enabled.is_some() => {
+                let update = LenovoManagerV0_1Update::builder()
+                    .with_kcs_enabled(enabled)
+                    .build();
+                oem_update(None, &update)
+            }
+            LenovoManagerSchema::V1_0(data) if data.kcs_enabled.is_some() => {
+                let state = if enabled {
+                    KcsState::Enabled
+                } else {
+                    KcsState::Disabled
+                };
+                let update = LenovoManagerV1_0Update::builder()
+                    .with_kcs_enabled(state)
+                    .build();
+                oem_update(None, &update)
+            }
+            _ => return Ok(None),
+        }
+        .map_err(Error::Json)?;
+        let update = ManagerUpdate::builder().with_oem(oem).build();
+
+        self.bmc
+            .update::<_, NavProperty<ManagerSchema>>(
+                &self.manager_id,
+                self.manager_etag.as_ref(),
+                &update,
+            )
+            .await?
+            .try_map_entity_async(|nav| async move { Manager::new(&self.bmc, &nav).await })
+            .await
+            .map(Some)
+    }
+
     /// Get lenovo security for the manager.
     ///
     /// Returns `Ok(None)` when Lenovo Security service link is absent.
@@ -103,19 +164,14 @@ impl<B: Bmc> LenovoManager<B> {
     ///
     /// Returns an error if fetching Lenovo Security service data fails.
     pub async fn security(&self) -> Result<Option<LenovoSecurityService<B>>, Error<B>> {
-        if let Some(p) = &self.base().security {
+        let security = match self.data.as_ref() {
+            LenovoManagerSchema::V0_1(data) => &data.security,
+            LenovoManagerSchema::V1_0(data) => &data.security,
+        };
+        if let Some(p) = security {
             LenovoSecurityService::new(&self.bmc, p).await.map(Some)
         } else {
             Ok(None)
-        }
-    }
-
-    /// Host-side IPMI access via KCS protocol.
-    #[must_use]
-    pub fn base(&self) -> &LenovoManagerPropertiesSchema {
-        match self.data.as_ref() {
-            LenovoManagerSchema::V0_1(data) => &data.base,
-            LenovoManagerSchema::V1_0(data) => &data.base,
         }
     }
 }

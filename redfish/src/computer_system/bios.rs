@@ -14,21 +14,28 @@
 // limitations under the License.
 //! Bios
 
+#[cfg(feature = "oem-hpe")]
+use crate::oem::hpe::HpeBios;
 use crate::schema::bios::Bios as BiosSchema;
 use crate::Error;
 use crate::NvBmc;
 use nv_redfish_core::Bmc;
 use nv_redfish_core::EdmPrimitiveType;
+use nv_redfish_core::EntityTypeRef as _;
+use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::NavProperty;
-use std::marker::PhantomData;
+use nv_redfish_core::RedfishSettings as _;
 use std::sync::Arc;
+
+pub use crate::schema::bios::AttributesUpdate;
+pub use crate::schema::bios::BiosUpdate;
 
 /// BIOS.
 ///
 /// Provides functions to access BIOS functions.
 pub struct Bios<B: Bmc> {
+    bmc: NvBmc<B>,
     data: Arc<BiosSchema>,
-    _marker: PhantomData<B>,
 }
 
 impl<B: Bmc> Bios<B> {
@@ -41,8 +48,8 @@ impl<B: Bmc> Bios<B> {
             .await
             .map_err(crate::Error::Bmc)
             .map(|data| Self {
+                bmc: bmc.clone(),
                 data,
-                _marker: PhantomData,
             })
     }
 
@@ -50,6 +57,116 @@ impl<B: Bmc> Bios<B> {
     #[must_use]
     pub fn raw(&self) -> Arc<BiosSchema> {
         self.data.clone()
+    }
+
+    /// Get the HPE OEM extension advertised by this BIOS resource.
+    ///
+    /// Returns `Ok(None)` when the BIOS does not include `Oem.Hpe`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if parsing the HPE BIOS extension fails.
+    #[cfg(feature = "oem-hpe")]
+    pub fn oem_hpe(&self) -> Result<Option<HpeBios<B>>, Error<B>> {
+        self.data
+            .oem
+            .as_ref()
+            .map_or_else(|| Ok(None), |oem| HpeBios::new(&self.bmc, oem))
+    }
+
+    /// Get the advertised BIOS settings object.
+    ///
+    /// Returns `Ok(None)` when this BIOS resource does not advertise
+    /// `@Redfish.Settings`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching the settings object fails.
+    pub async fn settings(&self) -> Result<Option<Self>, Error<B>> {
+        match self.data.settings_object() {
+            Some(settings) => Self::new(&self.bmc, &settings).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Update this BIOS resource.
+    ///
+    /// Call this method on the handle returned by [`Self::settings`] when the
+    /// service advertises `@Redfish.Settings`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating the BIOS resource fails.
+    pub async fn update(
+        &self,
+        update: &BiosUpdate,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        self.bmc
+            .update::<_, NavProperty<BiosSchema>>(self.data.odata_id(), self.data.etag(), update)
+            .await?
+            .try_map_entity_async(|nav| async move { Self::new(&self.bmc, &nav).await })
+            .await
+    }
+
+    /// Reset BIOS attributes to their defaults.
+    ///
+    /// This invokes the advertised `Bios.ResetBios` action, equivalent to:
+    ///
+    /// ```text
+    /// POST <advertised Bios.ResetBios target>
+    /// {}
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the action is unavailable or invocation fails.
+    pub async fn reset(&self) -> Result<ModificationResponse<()>, Error<B>>
+    where
+        B::Error: nv_redfish_core::ActionError,
+    {
+        let actions = self
+            .data
+            .actions
+            .as_ref()
+            .ok_or(Error::ActionNotAvailable)?;
+        if actions.reset_bios.is_none() {
+            return Err(Error::ActionNotAvailable);
+        }
+        actions
+            .reset_bios(self.bmc.as_ref())
+            .await
+            .map_err(Error::Bmc)
+    }
+
+    /// Change or clear a BIOS password.
+    ///
+    /// This invokes the advertised `Bios.ChangePassword` action with
+    /// `PasswordName`, optional `OldPassword`, and `NewPassword`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the action is unavailable or invocation fails.
+    pub async fn change_password(
+        &self,
+        password_name: String,
+        old_password: Option<String>,
+        new_password: String,
+    ) -> Result<ModificationResponse<()>, Error<B>>
+    where
+        B::Error: nv_redfish_core::ActionError,
+    {
+        let actions = self
+            .data
+            .actions
+            .as_ref()
+            .ok_or(Error::ActionNotAvailable)?;
+        if actions.change_password.is_none() {
+            return Err(Error::ActionNotAvailable);
+        }
+        actions
+            .change_password(self.bmc.as_ref(), password_name, old_password, new_password)
+            .await
+            .map_err(Error::Bmc)
     }
 
     /// Get bios attribute by key value.

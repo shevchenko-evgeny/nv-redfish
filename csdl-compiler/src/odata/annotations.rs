@@ -26,6 +26,7 @@ use crate::edmx::Namespace;
 use crate::edmx::NavigationProperty;
 use crate::edmx::Parameter;
 use crate::edmx::StructuralProperty;
+use crate::edmx::Term;
 use tagged_types::TaggedType;
 
 /// A brief description of a model element.
@@ -168,6 +169,13 @@ pub trait ODataAnnotations {
             })
     }
 
+    fn odata_is_url(&self) -> bool {
+        self.annotations()
+            .iter()
+            .find(|annotation| annotation.is_odata_annotation("IsURL"))
+            .is_some_and(|annotation| annotation.bool_value.unwrap_or(true))
+    }
+
     fn capabilities_insertable(&self) -> Option<Insertable<'_>> {
         self.annotations()
             .iter()
@@ -218,6 +226,12 @@ pub trait ODataAnnotations {
 }
 
 impl ODataAnnotations for EnumType {
+    fn annotations(&self) -> &Vec<Annotation> {
+        &self.annotations
+    }
+}
+
+impl ODataAnnotations for Term {
     fn annotations(&self) -> &Vec<Annotation> {
         &self.annotations
     }

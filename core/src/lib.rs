@@ -99,7 +99,15 @@ pub use action::Action;
 #[doc(inline)]
 pub use action::ActionError;
 #[doc(inline)]
+pub use bmc::without_event_ids;
+#[doc(inline)]
 pub use bmc::Bmc;
+#[doc(inline)]
+pub use bmc::BmcError;
+#[doc(inline)]
+pub use bmc::BmcErrorClass;
+#[doc(inline)]
+pub use bmc::StreamEvent;
 #[doc(inline)]
 pub use deserialize::de_optional_nullable;
 #[doc(inline)]
@@ -202,7 +210,7 @@ impl From<ODataId> for AsyncTaskLocation {
 }
 
 /// Outcome of a mutating Redfish operation that can complete asynchronously.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AsyncTask {
     /// Location to use for polling completion.
     pub location: AsyncTaskLocation,
@@ -339,10 +347,10 @@ pub trait Deletable: EntityTypeRef + for<'de> Deserialize<'de> {
     }
 }
 
-/// This trait is assigned to updatable entity types to support
-/// @Redfish.Settings workflow.
+/// Supports the `@Redfish.Settings` workflow on updatable entity types.
 pub trait RedfishSettings<E: EntityTypeRef>: Sized {
-    /// Reference to the enity type object.
+    /// Return a typed reference to the settings resource.
+    /// Inline settings objects are also returned as references to their identifiers.
     fn settings_object(&self) -> Option<NavProperty<E>>;
 }
 

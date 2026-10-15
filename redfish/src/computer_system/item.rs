@@ -27,16 +27,20 @@ use crate::patch_support::Payload;
 use crate::patch_support::ReadPatchFn;
 use crate::resource::PowerState;
 use crate::resource::ResetType;
+use crate::schema::computer_system::BootSource;
+use crate::schema::computer_system::BootSourceOverrideEnabled;
+use crate::schema::computer_system::BootSourceOverrideMode;
 use crate::schema::computer_system::ComputerSystem as ComputerSystemSchema;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
 
-use serde::Serialize;
 use std::convert::identity;
 use std::sync::Arc;
 use tagged_types::TaggedType;
+
+pub use crate::schema::computer_system::BootUpdate;
+pub use crate::schema::computer_system::ComputerSystemUpdate;
+pub use crate::schema::computer_system::IpmiHostInterfaceUpdate;
 
 #[cfg(feature = "bios")]
 use crate::computer_system::Bios;
@@ -54,10 +58,18 @@ use crate::computer_system::Storage;
 use crate::ethernet_interface::EthernetInterfaceCollection;
 #[cfg(feature = "log-services")]
 use crate::log_service::LogService;
+#[cfg(feature = "oem-hpe")]
+use crate::oem::hpe::HpeComputerSystemActions;
 #[cfg(feature = "oem-lenovo")]
 use crate::oem::lenovo::computer_system::LenovoComputerSystem;
+#[cfg(feature = "oem-lenovo")]
+use crate::oem::lenovo::LenovoComputerSystemActions;
 #[cfg(feature = "oem-nvidia")]
 use crate::oem::nvidia::NvidiaComputerSystem;
+#[cfg(feature = "oem-supermicro")]
+use crate::oem::supermicro::SupermicroComputerSystem;
+#[cfg(feature = "oem-supermicro")]
+use crate::oem::supermicro::SupermicroComputerSystemActions;
 
 #[doc(hidden)]
 pub enum ComputerSystemTag {}
@@ -92,18 +104,6 @@ pub type BootOptionReference<T> = TaggedType<T, BootOptionReferenceTag>;
 #[capability(inner_access, cloned)]
 pub enum BootOptionReferenceTag {}
 
-#[derive(Serialize)]
-struct BootPatch {
-    #[serde(rename = "BootOrder")]
-    boot_order: Vec<BootOptionReference<String>>,
-}
-
-#[derive(Serialize)]
-struct ComputerSystemBootOrderUpdate {
-    #[serde(rename = "Boot")]
-    boot: BootPatch,
-}
-
 /// Represents a computer system in the BMC.
 ///
 /// Provides access to system information and sub-resources such as processors.
@@ -111,6 +111,7 @@ pub struct ComputerSystem<B: Bmc> {
     #[allow(dead_code)] // feature-enabled...
     bmc: NvBmc<B>,
     data: Arc<ComputerSystemSchema>,
+    read_patch_fn: Option<ReadPatchFn>,
 }
 
 impl<B: Bmc> ComputerSystem<B> {
@@ -120,7 +121,8 @@ impl<B: Bmc> ComputerSystem<B> {
         nav: &NavProperty<ComputerSystemSchema>,
         read_patch_fn: Option<&ReadPatchFn>,
     ) -> Result<Self, Error<B>> {
-        if let Some(read_patch_fn) = read_patch_fn {
+        let read_patch_fn = read_patch_fn.cloned();
+        if let Some(read_patch_fn) = read_patch_fn.as_ref() {
             Payload::get(bmc.as_ref(), nav, read_patch_fn.as_ref()).await
         } else {
             nav.get(bmc.as_ref()).await.map_err(Error::Bmc)
@@ -128,6 +130,7 @@ impl<B: Bmc> ComputerSystem<B> {
         .map(|data| Self {
             bmc: bmc.clone(),
             data,
+            read_patch_fn,
         })
     }
 
@@ -186,6 +189,49 @@ impl<B: Bmc> ComputerSystem<B> {
     #[must_use]
     pub fn power_state(&self) -> Option<PowerState> {
         self.data.power_state.and_then(identity)
+    }
+
+    /// Whether the system's in-band IPMI host interface is enabled.
+    #[must_use]
+    pub fn ipmi_host_interface_enabled(&self) -> Option<bool> {
+        self.data
+            .ipmi_host_interface
+            .as_ref()
+            .and_then(|interface| interface.service_enabled)
+    }
+
+    /// Enable or disable the in-band IPMI host interface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating or fetching the returned system fails.
+    pub async fn set_ipmi_host_interface_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        self.update(
+            &ComputerSystemUpdate::builder()
+                .with_ipmi_host_interface(
+                    IpmiHostInterfaceUpdate::builder()
+                        .with_service_enabled(enabled)
+                        .build(),
+                )
+                .build(),
+        )
+        .await
+    }
+
+    /// Update this computer system.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating the computer system fails.
+    pub async fn update(
+        &self,
+        update: &ComputerSystemUpdate,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        self.update_at(self.data.odata_id(), self.data.etag(), update)
+            .await
     }
 
     /// Reset this computer system.
@@ -250,28 +296,74 @@ impl<B: Bmc> ComputerSystem<B> {
         &self,
         boot_order: Vec<BootOptionReference<String>>,
     ) -> Result<ModificationResponse<Self>, Error<B>> {
-        let update = ComputerSystemBootOrderUpdate {
-            boot: BootPatch { boot_order },
-        };
+        let update = ComputerSystemUpdate::builder()
+            .with_boot(
+                BootUpdate::builder()
+                    .with_boot_order(
+                        boot_order
+                            .into_iter()
+                            .map(|reference| reference.inner().clone())
+                            .collect(),
+                    )
+                    .build(),
+            )
+            .build();
 
         let settings = self.data.settings_object();
-
         let update_odata = settings
             .as_ref()
             .map_or_else(|| self.data.odata_id(), |settings| settings.odata_id());
+        self.update_at(update_odata, None, &update).await
+    }
 
-        self.bmc
+    /// Override the boot source for this computer system.
+    ///
+    /// `http_boot_uri` applies when `target` is `UefiHttp`. Like
+    /// [`Self::set_boot_order`], this writes to the settings object when
+    /// the system advertises one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating the system fails.
+    pub async fn set_boot_source_override(
+        &self,
+        target: BootSource,
+        enabled: BootSourceOverrideEnabled,
+        mode: Option<BootSourceOverrideMode>,
+        http_boot_uri: Option<String>,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        let mut boot = BootUpdate::builder()
+            .with_boot_source_override_target(target)
+            .with_boot_source_override_enabled(enabled);
+        if let Some(mode) = mode {
+            boot = boot.with_boot_source_override_mode(mode);
+        }
+        if let Some(uri) = http_boot_uri {
+            boot = boot.with_http_boot_uri(uri);
+        }
+        let update = ComputerSystemUpdate::builder()
+            .with_boot(boot.build())
+            .build();
+
+        let settings = self.data.settings_object();
+        let update_odata = settings
             .as_ref()
-            .update::<_, NavProperty<ComputerSystemSchema>>(update_odata, None, &update)
-            .await
-            .map_err(Error::Bmc)?
-            .try_map_entity_async(|nav| async move {
-                let data = nav.get(self.bmc.as_ref()).await.map_err(Error::Bmc)?;
+            .map_or_else(|| self.data.odata_id(), |settings| settings.odata_id());
+        self.update_at(update_odata, None, &update).await
+    }
 
-                Ok(Self {
-                    bmc: self.bmc.clone(),
-                    data,
-                })
+    /// Update the computer system resource at the supplied identifier.
+    async fn update_at(
+        &self,
+        odata_id: &nv_redfish_core::ODataId,
+        etag: Option<&nv_redfish_core::ODataETag>,
+        update: &ComputerSystemUpdate,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        self.bmc
+            .update::<_, NavProperty<ComputerSystemSchema>>(odata_id, etag, update)
+            .await?
+            .try_map_entity_async(|nav| async move {
+                Self::new(&self.bmc, &nav, self.read_patch_fn.as_ref()).await
             })
             .await
     }
@@ -451,7 +543,7 @@ impl<B: Bmc> ComputerSystem<B> {
     /// Returns an error if NVIDIA OEM data parsing/fetching fails.
     #[cfg(feature = "oem-nvidia")]
     pub async fn oem_nvidia(&self) -> Result<Option<NvidiaComputerSystem<B>>, Error<B>> {
-        if let Some(oem) = self.data.base.base.oem.as_ref() {
+        if let Some(oem) = self.data.oem.as_ref() {
             NvidiaComputerSystem::new(&self.bmc, oem).await
         } else {
             Ok(None)
@@ -467,12 +559,69 @@ impl<B: Bmc> ComputerSystem<B> {
     /// Returns an error if Lenovo OEM data parsing fails.
     #[cfg(feature = "oem-lenovo")]
     pub fn oem_lenovo(&self) -> Result<Option<LenovoComputerSystem<B>>, Error<B>> {
-        LenovoComputerSystem::new(&self.bmc, &self.data)
+        LenovoComputerSystem::new(&self.bmc, &self.data, self.read_patch_fn.as_ref())
     }
-}
 
-impl<B: Bmc> Resource for ComputerSystem<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
+    /// Get the Lenovo OEM actions advertised by this computer system.
+    ///
+    /// Returns `Ok(None)` when the system has no OEM actions object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Lenovo OEM actions cannot be parsed.
+    #[cfg(feature = "oem-lenovo")]
+    pub fn oem_lenovo_actions(&self) -> Result<Option<LenovoComputerSystemActions<B>>, Error<B>> {
+        self.data
+            .actions
+            .as_ref()
+            .and_then(|actions| actions.oem.as_ref())
+            .map(|actions| LenovoComputerSystemActions::new(&self.bmc, actions))
+            .transpose()
+    }
+
+    /// Get the HPE OEM actions advertised under `Oem.Hpe.Actions`.
+    ///
+    /// Returns `Ok(None)` when the system does not include `Oem.Hpe`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if HPE OEM data cannot be parsed.
+    #[cfg(feature = "oem-hpe")]
+    pub fn oem_hpe_actions(&self) -> Result<Option<HpeComputerSystemActions<B>>, Error<B>> {
+        HpeComputerSystemActions::new(&self.bmc, &self.data)
+    }
+
+    /// Get the Supermicro OEM properties advertised by this computer system.
+    ///
+    /// Returns `Ok(None)` when the system does not advertise `Oem.Supermicro`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Supermicro OEM data cannot be parsed.
+    #[cfg(feature = "oem-supermicro")]
+    pub fn oem_supermicro(&self) -> Result<Option<SupermicroComputerSystem<B>>, Error<B>> {
+        SupermicroComputerSystem::new(&self.bmc, &self.data)
+    }
+
+    /// Get the advertised Supermicro OEM system actions.
+    ///
+    /// Returns `Ok(None)` when the system does not advertise the Supermicro
+    /// AC-cycle action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Supermicro OEM actions cannot be parsed.
+    #[cfg(feature = "oem-supermicro")]
+    pub fn oem_supermicro_actions(
+        &self,
+    ) -> Result<Option<SupermicroComputerSystemActions<B>>, Error<B>> {
+        self.data
+            .actions
+            .as_ref()
+            .and_then(|actions| actions.oem.as_ref())
+            .map_or_else(
+                || Ok(None),
+                |actions| SupermicroComputerSystemActions::new(&self.bmc, actions),
+            )
     }
 }

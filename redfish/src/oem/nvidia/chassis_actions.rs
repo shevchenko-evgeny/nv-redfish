@@ -19,11 +19,13 @@ use crate::oem::nvidia::schema::chassis::OemActions as NvidiaChassisActionsSchem
 use crate::schema::chassis::OemActions as ChassisOemActionsSchema;
 use crate::Error;
 use crate::NvBmc;
+use nv_redfish_core::ActionError;
 use nv_redfish_core::Bmc;
 use nv_redfish_core::ModificationResponse;
 use serde::Deserialize as _;
 use std::sync::Arc;
 
+pub use crate::oem::nvidia::schema::nvidia_chassis::AuxPowerResetType;
 pub use crate::oem::nvidia::schema::nvidia_chassis::NvidiaChassisResetType;
 
 /// NVIDIA actions advertised by a Chassis resource.
@@ -44,6 +46,29 @@ impl<B: Bmc> NvidiaChassisActions<B> {
         })
     }
 
+    /// Cycle this chassis's auxiliary power.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the chassis does not advertise the NVIDIA
+    /// `AuxPowerReset` action or if invoking the action fails.
+    pub async fn aux_power_reset(
+        &self,
+        reset_type: AuxPowerResetType,
+    ) -> Result<ModificationResponse<()>, Error<B>>
+    where
+        B::Error: ActionError,
+    {
+        if self.data.aux_power_reset.is_none() {
+            return Err(Error::ActionNotAvailable);
+        }
+
+        self.data
+            .aux_power_reset(self.bmc.as_ref(), reset_type)
+            .await
+            .map_err(Error::Bmc)
+    }
+
     /// Reset this chassis or its DPU with an NVIDIA reset type.
     ///
     /// # Errors
@@ -55,7 +80,7 @@ impl<B: Bmc> NvidiaChassisActions<B> {
         reset_type: NvidiaChassisResetType,
     ) -> Result<ModificationResponse<()>, Error<B>>
     where
-        B::Error: nv_redfish_core::ActionError,
+        B::Error: ActionError,
     {
         if self.data.reset.is_none() {
             return Err(Error::ActionNotAvailable);

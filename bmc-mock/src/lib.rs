@@ -24,14 +24,18 @@ use std::error::Error as StdError;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
+use std::future::pending;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
+use futures_util::TryStreamExt as _;
 use nv_redfish_core::action::ActionTarget;
 use nv_redfish_core::query::ExpandQuery;
 use nv_redfish_core::ActionError;
+use nv_redfish_core::AsyncTask;
 use nv_redfish_core::Bmc as NvRedfishBmc;
+use nv_redfish_core::BmcErrorClass;
 use nv_redfish_core::EntityTypeRef;
 use nv_redfish_core::Expandable;
 #[cfg(feature = "update-service-deprecated")]
@@ -41,6 +45,7 @@ use nv_redfish_core::MultipartUpdateRequest;
 use nv_redfish_core::ODataETag;
 use nv_redfish_core::ODataId;
 use nv_redfish_core::SessionCreateResponse;
+use nv_redfish_core::StreamEvent;
 use nv_redfish_core::UploadReader;
 use serde::Serialize;
 use serde_json::from_value;
@@ -54,7 +59,9 @@ pub enum Error {
     MutexLock(String),
     NothingIsExpected,
     BadResponseJson(JsonError),
+    HttpStatus(u16),
     UnexpectedGet(ODataId, ExpectedRequest),
+    UnexpectedPoll(ODataId, ExpectedRequest),
     UnexpectedExpand(ODataId, ExpectedRequest),
     UnexpectedUpdate(ODataId, String, ExpectedRequest),
     UnexpectedCreate(ODataId, String, ExpectedRequest),
@@ -77,8 +84,12 @@ impl Display for Error {
                 write!(f, "nothing is expected to happen but something happened")
             }
             Self::BadResponseJson(err) => write!(f, "bad json response: {err}"),
+            Self::HttpStatus(status) => write!(f, "HTTP status {status}"),
             Self::UnexpectedGet(id, expected) => {
                 write!(f, "unexpected get: {id}; expected: {expected:?}")
+            }
+            Self::UnexpectedPoll(id, expected) => {
+                write!(f, "unexpected poll: {id}; expected: {expected:?}")
             }
             Self::UnexpectedExpand(id, expected) => {
                 write!(f, "unexpected expand: {id}; expected: {expected:?}")
@@ -131,6 +142,16 @@ impl Display for Error {
 }
 
 impl StdError for Error {}
+
+impl nv_redfish_core::BmcError for Error {
+    fn error_class(&self) -> BmcErrorClass {
+        match self {
+            Self::BadResponseJson(_) => BmcErrorClass::ResponseParse,
+            Self::HttpStatus(status) => BmcErrorClass::HttpResponse { status: *status },
+            _ => BmcErrorClass::Other,
+        }
+    }
+}
 
 impl Error {
     pub fn mutex_lock<T>(err: PoisonError<T>) -> Self {
@@ -225,7 +246,7 @@ where
     >(
         &self,
         in_id: &ODataId,
-        _etag: Option<&ODataETag>,
+        in_etag: Option<&ODataETag>,
         update: &V,
     ) -> Result<ModificationResponse<R>, Self::Error> {
         let expect = self
@@ -242,6 +263,14 @@ where
                 request: ExpectedRequest::Update { id, request },
                 response,
             } if id == *in_id && request == in_request => {
+                let response = response.map_err(|err| Error::ErrorResponse(Box::new(err)))?;
+                let result: R = from_value(response).map_err(Error::BadResponseJson)?;
+                Ok(ModificationResponse::Entity(result))
+            }
+            Expect {
+                request: ExpectedRequest::UpdateWithEtag { id, etag, request },
+                response,
+            } if id == *in_id && etag.as_ref() == in_etag && request == in_request => {
                 let response = response.map_err(|err| Error::ErrorResponse(Box::new(err)))?;
                 let result: R = from_value(response).map_err(Error::BadResponseJson)?;
                 Ok(ModificationResponse::Entity(result))
@@ -393,6 +422,23 @@ where
                 let result: R = from_value(response).map_err(Error::BadResponseJson)?;
                 Ok(ModificationResponse::Entity(result))
             }
+            Expect {
+                request:
+                    ExpectedRequest::ActionTask {
+                        target,
+                        request,
+                        task,
+                    },
+                ..
+            } if target == action.target && request == in_request => {
+                Ok(ModificationResponse::Task(task))
+            }
+            Expect {
+                request: ExpectedRequest::ActionEmpty { target, request },
+                ..
+            } if target == action.target && request == in_request => {
+                Ok(ModificationResponse::Empty)
+            }
             _ => Err(Error::UnexpectedAction(
                 action.target.clone(),
                 in_request.to_string(),
@@ -504,6 +550,15 @@ where
         &self,
         in_uri: &str,
     ) -> Result<nv_redfish_core::BoxTryStream<T, Self::Error>, Self::Error> {
+        let events = self.stream_events::<T>(in_uri, None).await?;
+        Ok(Box::pin(events.map_ok(|event| event.data)))
+    }
+
+    async fn stream_events<T: Sized + for<'de> serde::Deserialize<'de> + Send + 'static>(
+        &self,
+        in_uri: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<nv_redfish_core::BoxTryStream<StreamEvent<T>, Self::Error>, Self::Error> {
         let expect = self
             .expect
             .lock()
@@ -514,16 +569,95 @@ where
             Expect {
                 request: ExpectedRequest::Stream { uri },
                 response,
-            } if uri == *in_uri => {
+            } if uri == *in_uri && last_event_id.is_none() => {
                 let response = response.map_err(|err| Error::ErrorResponse(Box::new(err)))?;
-                let result: Vec<T> = from_value(response).map_err(Error::BadResponseJson)?;
-                Ok(Box::pin(futures_util::stream::iter(
-                    result.into_iter().map(Ok),
-                )))
+                let payloads: Vec<T> = from_value(response).map_err(Error::BadResponseJson)?;
+                let events = payloads.into_iter().map(|data| StreamEvent {
+                    last_event_id: None,
+                    data,
+                });
+                Ok(Box::pin(futures_util::stream::iter(events.map(Ok))))
             }
-            _ => Err(Error::UnexpectedStream(in_uri.to_string(), expect.request)),
+            Expect {
+                request:
+                    ExpectedRequest::StreamEvents {
+                        uri,
+                        last_event_id: expected,
+                    },
+                response,
+            } if uri == *in_uri && expected.as_deref() == last_event_id => {
+                let response = response.map_err(|err| Error::ErrorResponse(Box::new(err)))?;
+                let events: Vec<ScriptedEvent<T>> =
+                    from_value(response).map_err(Error::BadResponseJson)?;
+                let events = events.into_iter().map(|event| StreamEvent {
+                    last_event_id: event.last_event_id,
+                    data: event.data,
+                });
+                Ok(Box::pin(futures_util::stream::iter(events.map(Ok))))
+            }
+            _ => {
+                let request = match last_event_id {
+                    Some(id) => format!("{in_uri} resumed after {id:?}"),
+                    None => in_uri.to_string(),
+                };
+                Err(Error::UnexpectedStream(request, expect.request))
+            }
         }
     }
+
+    async fn poll<T: Send + Sync + Sized + for<'de> serde::Deserialize<'de>>(
+        &self,
+        location: &ODataId,
+    ) -> Result<ModificationResponse<T>, Self::Error> {
+        let expect = self
+            .expect
+            .lock()
+            .map_err(Error::mutex_lock)?
+            .pop_front()
+            .ok_or(Error::NothingIsExpected)?;
+        match expect {
+            Expect {
+                request: ExpectedRequest::PollResult { id },
+                response,
+            } if id == *location => {
+                let response = response.map_err(|err| Error::ErrorResponse(Box::new(err)))?;
+                let result: T = from_value(response).map_err(Error::BadResponseJson)?;
+                Ok(ModificationResponse::Entity(result))
+            }
+            Expect {
+                request:
+                    ExpectedRequest::PollPending {
+                        id,
+                        location: next_location,
+                        retry_after,
+                    },
+                ..
+            } if id == *location => Ok(ModificationResponse::Task(AsyncTask {
+                location: next_location.unwrap_or_else(|| location.clone()).into(),
+                retry_after,
+            })),
+            Expect {
+                request: ExpectedRequest::PollEmpty { id },
+                ..
+            } if id == *location => Ok(ModificationResponse::Empty),
+            Expect {
+                request: ExpectedRequest::PollStatus { id, status },
+                ..
+            } if id == *location => Err(Error::HttpStatus(status)),
+            Expect {
+                request: ExpectedRequest::PollWait { id },
+                ..
+            } if id == *location => pending().await,
+            _ => Err(Error::UnexpectedPoll(location.clone(), expect.request)),
+        }
+    }
+}
+
+/// One event as [`Expect::stream_events`] scripts it.
+#[derive(serde::Deserialize)]
+struct ScriptedEvent<T> {
+    last_event_id: Option<String>,
+    data: T,
 }
 
 impl ActionError for Error {

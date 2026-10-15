@@ -17,11 +17,14 @@
 use std::error::Error as StdError;
 use std::sync::Arc;
 
+use nv_redfish::account::AccountServiceConfig;
 use nv_redfish::computer_system::BootOptionReference;
+use nv_redfish::computer_system::BootOptionUpdate;
 use nv_redfish::computer_system::ComputerSystem;
+use nv_redfish::computer_system::ComputerSystemUpdate;
+use nv_redfish::computer_system::SecureBootUpdate;
 use nv_redfish::computer_system::SystemCollection;
 use nv_redfish::resource::ResetType;
-use nv_redfish::Resource;
 use nv_redfish::ServiceRoot;
 use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::ODataId;
@@ -32,6 +35,7 @@ use nv_redfish_tests::assert_task;
 use nv_redfish_tests::async_task;
 use nv_redfish_tests::expect_redfish_reset_action;
 use nv_redfish_tests::json_merge;
+use nv_redfish_tests::liteon_powershelf_service_root;
 use nv_redfish_tests::redfish_action_payload;
 use nv_redfish_tests::redfish_empty_actions_payload;
 use nv_redfish_tests::Bmc;
@@ -46,6 +50,59 @@ use tokio::test;
 const SERVICE_ROOT_DATA_TYPE: &str = "#ServiceRoot.v1_13_0.ServiceRoot";
 const SYSTEM_COLLECTION_DATA_TYPE: &str = "#ComputerSystemCollection.ComputerSystemCollection";
 const SYSTEM_DATA_TYPE: &str = "#ComputerSystem.v1_20_0.ComputerSystem";
+const BOOT_OPTION_COLLECTION_DATA_TYPE: &str = "#BootOptionCollection.BootOptionCollection";
+const BOOT_OPTION_DATA_TYPE: &str = "#BootOption.v1_0_4.BootOption";
+const SECURE_BOOT_DATA_TYPE: &str = "#SecureBoot.v1_1_0.SecureBoot";
+
+#[test]
+async fn secure_boot_typed_update_uses_uri_and_maps_entity() -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = computer_system_ids();
+    let secure_boot_id = format!("{}/SecureBoot", ids.system_id);
+    let system = get_system(
+        bmc.clone(),
+        &ids,
+        computer_system(&ids, json!({ "SecureBoot": { ODATA_ID: &secure_boot_id } })),
+    )
+    .await?;
+
+    bmc.expect(Expect::get(
+        &secure_boot_id,
+        json!({
+            ODATA_ID: &secure_boot_id,
+            ODATA_TYPE: SECURE_BOOT_DATA_TYPE,
+            "Id": "SecureBoot",
+            "Name": "Secure Boot",
+            "SecureBootEnable": false
+        }),
+    ));
+    let secure_boot = system
+        .secure_boot()
+        .await?
+        .ok_or_else(|| std::io::Error::other("missing secure boot"))?;
+    let update = SecureBootUpdate::builder()
+        .with_secure_boot_enable(true)
+        .build();
+
+    bmc.expect(Expect::update(
+        &secure_boot_id,
+        json!({ "SecureBootEnable": true }),
+        json!({
+            ODATA_ID: &secure_boot_id,
+            ODATA_TYPE: SECURE_BOOT_DATA_TYPE,
+            "Id": "SecureBoot",
+            "Name": "Secure Boot",
+            "SecureBootEnable": true
+        }),
+    ));
+
+    let ModificationResponse::Entity(updated) = secure_boot.update(&update).await? else {
+        return Err(std::io::Error::other("expected secure boot entity response").into());
+    };
+    assert_eq!(updated.secure_boot_enable(), Some(true));
+
+    Ok(())
+}
 
 #[test]
 async fn reset_invokes_computer_system_reset_action() -> Result<(), Box<dyn StdError>> {
@@ -122,6 +179,199 @@ async fn set_boot_order_preserves_task_and_empty_responses() -> Result<(), Box<d
 }
 
 #[test]
+async fn computer_system_update_preserves_reference_response() -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = computer_system_ids();
+    let service_root = expect_nvidia_dpu_service_root(bmc.clone(), &ids).await?;
+    bmc.expect(Expect::expand(
+        &ids.systems_id,
+        json!({
+            ODATA_ID: &ids.systems_id,
+            ODATA_TYPE: SYSTEM_COLLECTION_DATA_TYPE,
+            "Id": resource_name(&ids.systems_id),
+            "Name": "Computer System Collection",
+            "Members": [
+                computer_system(&ids, json!({ "HostName": "old-host", "UUID": "" }))
+            ]
+        }),
+    ));
+    let mut systems = service_root
+        .systems()
+        .await?
+        .ok_or("systems missing")?
+        .members()
+        .await?;
+    let system = systems.pop().ok_or("computer system missing")?;
+    assert_eq!(system.raw().uuid, Some(None));
+    let update = ComputerSystemUpdate::builder()
+        .with_host_name("new-host".into())
+        .build();
+
+    bmc.expect(Expect::update(
+        &ids.system_id,
+        json!({ "HostName": "new-host" }),
+        json!({ ODATA_ID: &ids.system_id }),
+    ));
+    bmc.expect(Expect::get(
+        &ids.system_id,
+        computer_system(&ids, json!({ "HostName": "new-host", "UUID": "" })),
+    ));
+
+    let ModificationResponse::Entity(updated) = system.update(&update).await? else {
+        return Err("expected computer system entity response".into());
+    };
+    assert_eq!(updated.raw().host_name, Some(Some("new-host".into())));
+    assert_eq!(updated.raw().uuid, Some(None));
+    Ok(())
+}
+
+#[test]
+async fn set_boot_order_uses_advertised_settings_resource() -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = computer_system_ids();
+    let settings_id = format!("{}/SD", ids.system_id);
+    let system = get_system(
+        bmc.clone(),
+        &ids,
+        computer_system(
+            &ids,
+            json!({
+                "@Redfish.Settings": {
+                    "SettingsObject": { ODATA_ID: &settings_id }
+                },
+                "Boot": { "BootOrder": ["Boot0001"] }
+            }),
+        ),
+    )
+    .await?;
+
+    bmc.expect(Expect::update(
+        &settings_id,
+        json!({ "Boot": { "BootOrder": ["Boot0002"] } }),
+        json!({ ODATA_ID: &settings_id }),
+    ));
+    bmc.expect(Expect::get(
+        &settings_id,
+        json!({
+            ODATA_ID: &settings_id,
+            ODATA_TYPE: SYSTEM_DATA_TYPE,
+            "Id": "SD",
+            "Name": "System Settings",
+            "Boot": { "BootOrder": ["Boot0002"] }
+        }),
+    ));
+
+    assert!(matches!(
+        system
+            .set_boot_order(vec![BootOptionReference::new("Boot0002".into())])
+            .await?,
+        ModificationResponse::Entity(_)
+    ));
+    Ok(())
+}
+
+#[test]
+async fn boot_option_settings_routes_to_advertised_sd_and_preserves_outcomes(
+) -> Result<(), Box<dyn StdError>> {
+    let bmc = Arc::new(Bmc::default());
+    let ids = computer_system_ids();
+    let boot_options_id = format!("{}/BootOptions", ids.system_id);
+    let boot_option_id = format!("{boot_options_id}/Boot0001");
+    let settings_id = format!("{boot_option_id}/SD");
+    let system = get_system(
+        bmc.clone(),
+        &ids,
+        computer_system(
+            &ids,
+            json!({
+                "Boot": {
+                    "BootOptions": { ODATA_ID: &boot_options_id }
+                }
+            }),
+        ),
+    )
+    .await?;
+    bmc.expect(Expect::expand(
+        &boot_options_id,
+        json!({
+            ODATA_ID: &boot_options_id,
+            ODATA_TYPE: BOOT_OPTION_COLLECTION_DATA_TYPE,
+            "Name": "Boot Options",
+            "Members": [{
+                ODATA_ID: &boot_option_id,
+                ODATA_TYPE: BOOT_OPTION_DATA_TYPE,
+                "Id": "Boot0001",
+                "Name": "Boot0001",
+                "BootOptionReference": "Boot0001",
+                "BootOptionEnabled": true,
+                "@Redfish.Settings": {
+                    "SettingsObject": { ODATA_ID: &settings_id }
+                }
+            }]
+        }),
+    ));
+    let mut options = system
+        .boot_options()
+        .await?
+        .ok_or("boot options missing")?
+        .members()
+        .await?;
+    let option = options.pop().ok_or("boot option missing")?;
+    let update = BootOptionUpdate::builder()
+        .with_boot_option_enabled(false)
+        .build();
+    bmc.expect(Expect::update(
+        &boot_option_id,
+        json!({ "BootOptionEnabled": false }),
+        json!({
+            ODATA_ID: &boot_option_id,
+            ODATA_TYPE: BOOT_OPTION_DATA_TYPE,
+            "Id": "Boot0001",
+            "Name": "Boot0001",
+            "BootOptionReference": "Boot0001",
+            "BootOptionEnabled": false
+        }),
+    ));
+    assert!(matches!(
+        option.update(&update).await?,
+        ModificationResponse::Entity(_)
+    ));
+
+    bmc.expect(Expect::get(
+        &settings_id,
+        json!({
+            ODATA_ID: &settings_id,
+            ODATA_TYPE: BOOT_OPTION_DATA_TYPE,
+            "Id": "Boot0001",
+            "Name": "Boot0001 Settings",
+            "BootOptionReference": "Boot0001",
+            "BootOptionEnabled": true
+        }),
+    ));
+    let settings = option
+        .settings()
+        .await?
+        .ok_or("boot option settings missing")?;
+
+    bmc.expect(Expect::update_task(
+        &settings_id,
+        json!({ "BootOptionEnabled": false }),
+        async_task("/redfish/v1/TaskService/Tasks/boot-option", 3),
+    ));
+    assert_task(
+        settings.update(&update).await?,
+        "/redfish/v1/TaskService/Tasks/boot-option",
+        3,
+    );
+    bmc.expect(Expect::update_empty(
+        &settings_id,
+        json!({ "BootOptionEnabled": false }),
+    ));
+    assert_empty(settings.update(&update).await?);
+    Ok(())
+}
+
+#[test]
 async fn reset_returns_action_not_available_when_computer_system_reset_is_absent(
 ) -> Result<(), Box<dyn StdError>> {
     let bmc = Arc::new(Bmc::default());
@@ -184,8 +434,35 @@ async fn ami_viking_missing_root_systems_nav_workaround() -> Result<(), Box<dyn 
 }
 
 #[test]
+async fn liteon_f16_missing_root_systems_nav_workaround() -> Result<(), Box<dyn StdError>> {
+    // Platform under test: Lite-On F16 power shelf (`Vendor=LITE-ON TECHNOLOGY CORP.`).
+    // Quirk under test: missing root Systems navigation property; `/Systems` is fetched directly.
+    let bmc = Arc::new(Bmc::default());
+    let ids = computer_system_ids();
+    let computer_system = computer_system(&ids, json!({}));
+    let service_root =
+        expect_liteon_powershelf_service_root_without_systems(bmc.clone(), &ids).await?;
+    bmc.expect(Expect::get(
+        &ids.systems_id,
+        json!({
+            ODATA_ID: &ids.systems_id,
+            ODATA_TYPE: &SYSTEM_COLLECTION_DATA_TYPE,
+            "Id": resource_name(&ids.systems_id),
+            "Name": "Computer System Collection",
+            "Members": [computer_system]
+        }),
+    ));
+
+    let systems = service_root.systems().await?.unwrap();
+    let members = systems.members().await?;
+    assert_eq!(members.len(), 1);
+
+    Ok(())
+}
+
+#[test]
 async fn anonymous_1_9_0_missing_root_systems_nav_workaround() -> Result<(), Box<dyn StdError>> {
-    // Platform under test: Liteon powershelf class (anonymous Redfish 1.9.0 root).
+    // Platform under test: anonymous Redfish 1.9.0 root (no vendor).
     // Quirk under test: missing root Systems navigation property.
     let bmc = Arc::new(Bmc::default());
     let ids = computer_system_ids();
@@ -319,7 +596,11 @@ async fn null_collection_member_test() -> Result<(), Box<dyn StdError>> {
 
     assert_eq!(members.len(), 0);
 
-    let _account_service = service_root.account_service().await?.unwrap().raw();
+    let _account_service = service_root
+        .account_service(AccountServiceConfig::standard())
+        .await?
+        .unwrap()
+        .raw();
 
     let storage = systems[0].storage_controllers().await?.unwrap();
     assert_eq!(storage.len(), 0);
@@ -504,6 +785,17 @@ async fn expect_anonymous_1_9_service_root_without_systems(
     ServiceRoot::new(bmc).await.map_err(Into::into)
 }
 
+async fn expect_liteon_powershelf_service_root_without_systems(
+    bmc: Arc<Bmc>,
+    ids: &ComputerSystemIds,
+) -> Result<ServiceRoot<Bmc>, Box<dyn StdError>> {
+    bmc.expect(Expect::get(
+        &ids.root_id,
+        liteon_powershelf_service_root(&ids.root_id, json!({})),
+    ));
+    ServiceRoot::new(bmc).await.map_err(Into::into)
+}
+
 #[test]
 async fn viking_with_garbage_in_computer_systems() -> Result<(), Box<dyn StdError>> {
     // Viking response with the payload: HGX_Baseboard_0/LogServices/FDR should be filtered out.
@@ -558,7 +850,10 @@ async fn viking_with_garbage_in_computer_systems() -> Result<(), Box<dyn StdErro
     // Should only have DGX and HGX_Baseboard_0, not the garbage FDR entry
     assert_eq!(members.len(), 2);
 
-    let member_ids: Vec<_> = members.iter().map(|m| m.odata_id().to_string()).collect();
+    let member_ids: Vec<_> = members
+        .iter()
+        .map(|m| m.raw().odata_id.to_string())
+        .collect();
     assert!(member_ids.contains(&dgx_id));
     assert!(member_ids.contains(&hgx_id));
     assert!(!member_ids.contains(&garbage_id));

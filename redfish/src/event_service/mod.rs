@@ -23,14 +23,13 @@ use crate::patch_support::ReadPatchFn;
 use crate::schema::event_service::EventService as EventServiceSchema;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
 use crate::ServiceRoot;
 use futures_util::future;
 use futures_util::TryStreamExt as _;
 use nv_redfish_core::odata::ODataType;
 use nv_redfish_core::Bmc;
 use nv_redfish_core::BoxTryStream;
+use nv_redfish_core::StreamEvent;
 use serde::de;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -98,9 +97,16 @@ impl<B: Bmc> EventService<B> {
             let mut sse_read_patches = Vec::new();
             let mut sse_event_record_patches: Vec<patch::EventRecordPatchFn> = Vec::new();
 
+            // Remove empty links before deciding whether a record is reference-only.
+            if bmc.quirks.event_service_sse_empty_log_entry() {
+                sse_event_record_patches.push(patch::patch_empty_log_entry);
+            }
+
+            // Record ID generation below needs MemberId to be present first.
             if bmc.quirks.event_service_sse_no_member_id() {
                 sse_event_record_patches.push(patch::patch_missing_event_record_member_id);
             }
+
             if bmc.quirks.event_service_sse_missing_event_type() {
                 sse_event_record_patches.push(patch::patch_missing_event_type_to_other);
             }
@@ -154,6 +160,31 @@ impl<B: Bmc> EventService<B> {
         B: 'static,
         B::Error: 'static,
     {
+        let events = self.events_from(None).await?;
+        Ok(Box::pin(events.map_ok(|event| event.data)))
+    }
+
+    /// Open an SSE stream of Redfish event payloads with the id each carries,
+    /// resuming after `last_event_id`.
+    ///
+    /// Payloads are decoded as by [`EventService::events`]. Each item is a
+    /// [`StreamEvent`] with the event id in effect, which a consumer that lost
+    /// the stream passes back here to resume after the last payload it
+    /// handled; `None` starts at the device's live position. A transport that
+    /// does not surface event ids yields `None` for every id and cannot
+    /// resume.
+    ///
+    /// # Errors
+    ///
+    /// As [`EventService::events`].
+    pub async fn events_from(
+        &self,
+        last_event_id: Option<&str>,
+    ) -> Result<BoxTryStream<StreamEvent<EventStreamPayload>, Error<B>>, Error<B>>
+    where
+        B: 'static,
+        B::Error: 'static,
+    {
         let stream_uri = self
             .data
             .server_sent_event_uri
@@ -163,28 +194,40 @@ impl<B: Bmc> EventService<B> {
         let stream = self
             .bmc
             .as_ref()
-            .stream::<JsonValue>(stream_uri)
+            .stream_events::<JsonValue>(stream_uri, last_event_id)
             .await
             .map_err(Error::Bmc)?;
 
         let sse_read_patches = self.sse_read_patches.clone();
-        let stream = stream.map_err(Error::Bmc).and_then(move |payload| {
-            let patched = sse_read_patches
-                .iter()
-                .fold(payload, |acc, patch| patch(acc));
+        let missing_envelope_ids = self.bmc.quirks.event_service_sse_missing_envelope_ids();
+
+        let stream = stream.map_err(Error::Bmc).and_then(move |event| {
+            let StreamEvent {
+                last_event_id,
+                data,
+            } = event;
+
+            // Supply Id before the existing envelope @odata.id patch. The transport
+            // cursor is only borrowed: it may be inherited and remains unchanged.
+            let data = if missing_envelope_ids {
+                patch::patch_missing_event_id(data, last_event_id.as_deref())
+            } else {
+                data
+            };
+
+            let patched = sse_read_patches.iter().fold(data, |acc, patch| patch(acc));
 
             future::ready(
-                serde_json::from_value::<EventStreamPayload>(patched).map_err(Error::Json),
+                serde_json::from_value::<EventStreamPayload>(patched)
+                    .map(|data| StreamEvent {
+                        last_event_id,
+                        data,
+                    })
+                    .map_err(Error::Json),
             )
         });
 
         Ok(Box::pin(stream))
-    }
-}
-
-impl<B: Bmc> Resource for EventService<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
     }
 }
 

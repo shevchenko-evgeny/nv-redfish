@@ -88,9 +88,15 @@ pub mod mac_address;
 /// Accounts Service.
 #[cfg(feature = "accounts")]
 pub mod account;
+/// Certificates.
+#[cfg(feature = "certificates")]
+pub mod certificate;
 /// Chassis.
 #[cfg(feature = "chassis")]
 pub mod chassis;
+/// Component integrity and attestation.
+#[cfg(feature = "component-integrity")]
+pub mod component_integrity;
 /// Computer System.
 #[cfg(feature = "computer-systems")]
 pub mod computer_system;
@@ -123,9 +129,15 @@ pub mod ethernet_interface;
 /// Event Service.
 #[cfg(feature = "event-service")]
 pub mod event_service;
+/// Fabrics and switches.
+#[cfg(feature = "fabrics")]
+pub mod fabric;
 /// Host interfaces.
 #[cfg(feature = "host-interfaces")]
 pub mod host_interface;
+/// Job Service.
+#[cfg(feature = "job-service")]
+pub mod job_service;
 /// Log Service.
 #[cfg(feature = "log-services")]
 pub mod log_service;
@@ -143,6 +155,9 @@ pub mod power_equipment;
 /// Metrics and sensor abstraction.
 #[cfg(feature = "sensors")]
 pub mod sensor;
+/// Serial interfaces.
+#[cfg(feature = "serial-interfaces")]
+pub mod serial_interface;
 /// Session Service.
 #[cfg(feature = "session-service")]
 pub mod session_service;
@@ -190,9 +205,9 @@ pub use error::Error;
 #[doc(inline)]
 pub use nv_redfish_core::Bmc;
 #[doc(inline)]
-pub use protocol_features::ProtocolFeatures;
+pub use nv_redfish_core::StreamEvent;
 #[doc(inline)]
-pub use resource::Resource;
+pub use protocol_features::ProtocolFeatures;
 #[doc(inline)]
 pub use service_root::ServiceRoot;
 
@@ -203,5 +218,4 @@ pub use resource::ResourceProvidesStatus;
 #[cfg(feature = "resource-status")]
 pub(crate) use crate::schema::resource::Status as ResourceStatusSchema;
 
-pub(crate) use crate::schema::resource::Resource as ResourceSchema;
 pub(crate) use bmc::NvBmc;

@@ -19,8 +19,6 @@ use crate::computer_system::processor_metrics::ProcessorMetrics;
 use crate::schema::processor::Processor as ProcessorSchema;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
 use nv_redfish_core::Bmc;
 use nv_redfish_core::NavProperty;
 use std::sync::Arc;
@@ -31,6 +29,8 @@ use crate::control::Control;
 use crate::environment_metrics::EnvironmentMetrics;
 #[cfg(feature = "sensors")]
 use crate::extract_sensor_uris;
+#[cfg(feature = "oem-nvidia")]
+use crate::oem::nvidia::NvidiaProcessor;
 #[cfg(feature = "sensors")]
 use crate::sensor::SensorLink;
 
@@ -64,6 +64,21 @@ impl<B: Bmc> Processor<B> {
     #[must_use]
     pub fn raw(&self) -> Arc<ProcessorSchema> {
         self.data.clone()
+    }
+
+    /// NVIDIA OEM extension.
+    ///
+    /// Returns `Ok(None)` when the processor does not include NVIDIA OEM data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if NVIDIA OEM data parsing fails.
+    #[cfg(feature = "oem-nvidia")]
+    pub fn oem_nvidia(&self) -> Result<Option<NvidiaProcessor>, Error<B>> {
+        self.data
+            .oem
+            .as_ref()
+            .map_or_else(|| Ok(None), NvidiaProcessor::new)
     }
 
     /// Get processor metrics.
@@ -158,11 +173,5 @@ impl<B: Bmc> Processor<B> {
             .into_iter()
             .map(|r| SensorLink::new(&self.bmc, r))
             .collect())
-    }
-}
-
-impl<B: Bmc> Resource for Processor<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
     }
 }

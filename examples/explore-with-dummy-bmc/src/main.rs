@@ -65,6 +65,8 @@ impl Display for Error {
 
 impl StdError for Error {}
 
+impl nv_redfish_core::BmcError for Error {}
+
 #[derive(Debug, Default)]
 pub struct MockBmc {}
 
@@ -596,6 +598,13 @@ impl Bmc for MockBmc {
         Ok(ModificationResponse::Entity(result))
     }
 
+    async fn poll<R: Send + Sync + Sized + for<'de> Deserialize<'de>>(
+        &self,
+        _uri: &ODataId,
+    ) -> Result<ModificationResponse<R>, Self::Error> {
+        Ok(ModificationResponse::Empty)
+    }
+
     async fn multipart_update<U, V, R>(
         &self,
         _uri: &str,
@@ -728,7 +737,7 @@ async fn main() -> Result<(), Error> {
 
     for chassis in &chassis.members {
         let chassis = chassis.get(&bmc).await?;
-        println!("Chassis: {} (id: {})", chassis.base.name, chassis.base.id);
+        println!("Chassis: {} (id: {})", chassis.name, chassis.id);
         println!(
             "  Model: {}",
             chassis
@@ -747,7 +756,7 @@ async fn main() -> Result<(), Error> {
             let pcie_device = pcie_device.get(&bmc).await?;
             println!(
                 "  PCI Device: {} (id: {})",
-                pcie_device.base.name, pcie_device.base.id
+                pcie_device.name, pcie_device.id
             );
             let pcie_functions = pcie_device
                 .pcie_functions
@@ -759,7 +768,7 @@ async fn main() -> Result<(), Error> {
                 let pcie_function = pcie_function.get(&bmc).await?;
                 println!(
                     "    Function: {} (id: {})",
-                    pcie_function.base.name, pcie_function.base.id
+                    pcie_function.name, pcie_function.id
                 );
             }
         }
@@ -778,7 +787,7 @@ async fn main() -> Result<(), Error> {
         .get(&bmc)
         .await?;
 
-    println!("System {} (id: {}):", system.base.name, system.base.id);
+    println!("System {} (id: {}):", system.name, system.id);
     println!(
         "  BIOS Version: {}",
         system
@@ -801,8 +810,6 @@ async fn main() -> Result<(), Error> {
     // Oem:
     let contoso_oem: Constoso = serde_json::from_value(
         service_root
-            .base
-            .base
             .oem
             .as_ref()
             .ok_or(Error::ExpectedField("oem"))?

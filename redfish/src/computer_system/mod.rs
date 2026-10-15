@@ -36,6 +36,8 @@ pub mod processor;
 pub mod processor_metrics;
 #[cfg(feature = "secure-boot")]
 pub mod secure_boot;
+#[cfg(feature = "secure-boot")]
+pub mod secure_boot_database;
 #[cfg(feature = "storages")]
 pub mod storage;
 
@@ -43,7 +45,6 @@ use crate::patch_support::CollectionWithPatch;
 use crate::patch_support::FilterFn;
 use crate::patch_support::JsonValue;
 use crate::patch_support::ReadPatchFn;
-use crate::resource::Resource as _;
 use crate::schema::computer_system::ComputerSystem as ComputerSystemSchema;
 use crate::schema::computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema;
 use crate::schema::resource::ResourceCollection;
@@ -56,19 +57,14 @@ use std::convert::identity;
 use std::sync::Arc;
 
 #[doc(inline)]
-pub use item::BootOptionReference;
-#[doc(inline)]
-pub use item::ComputerSystem;
+pub use item::{BootOptionReference, BootUpdate, ComputerSystem, ComputerSystemUpdate};
 
 #[doc(inline)]
 #[cfg(feature = "bios")]
-pub use bios::Bios;
+pub use bios::{AttributesUpdate, Bios, BiosUpdate};
 #[doc(inline)]
 #[cfg(feature = "boot-options")]
-pub use boot_option::BootOption;
-#[doc(inline)]
-#[cfg(feature = "boot-options")]
-pub use boot_option::BootOptionCollection;
+pub use boot_option::{BootOption, BootOptionCollection, BootOptionUpdate};
 #[doc(inline)]
 #[cfg(feature = "storages")]
 pub use drive::Drive;
@@ -91,8 +87,19 @@ pub use secure_boot::SecureBoot;
 #[cfg(feature = "secure-boot")]
 pub use secure_boot::SecureBootCurrentBootType;
 #[doc(inline)]
+#[cfg(feature = "secure-boot")]
+pub use secure_boot::SecureBootResetKeysType;
+#[doc(inline)]
+#[cfg(feature = "secure-boot")]
+pub use secure_boot::SecureBootUpdate;
+#[doc(inline)]
+#[cfg(feature = "secure-boot")]
+pub use secure_boot_database::{
+    SecureBootDatabase, SecureBootDatabaseCollection, SecureBootDatabaseResetKeysType,
+};
+#[doc(inline)]
 #[cfg(feature = "storages")]
-pub use storage::Storage;
+pub use storage::{Storage, Volume, VolumeCollection};
 
 /// Computer system collection.
 ///
@@ -143,7 +150,7 @@ impl<B: Bmc> SystemCollection<B> {
             .map(Some)
         } else if bmc.quirks.bug_missing_root_nav_properties() {
             bmc.expand_property(&NavProperty::new_reference(
-                format!("{}/Systems", root.odata_id()).into(),
+                format!("{}/Systems", root.root.odata_id).into(),
             ))
             .await
             .map(Some)
@@ -180,7 +187,16 @@ impl<B: Bmc> CollectionWithPatch<ComputerSystemCollectionSchema, ComputerSystemS
         base: ResourceCollection,
         members: Vec<NavProperty<ComputerSystemSchema>>,
     ) -> ComputerSystemCollectionSchema {
-        ComputerSystemCollectionSchema { base, members }
+        ComputerSystemCollectionSchema {
+            odata_id: base.odata_id,
+            odata_etag: base.odata_etag,
+            odata_type: base.odata_type,
+            settings_annotations: base.settings_annotations,
+            description: base.description,
+            name: base.name,
+            oem: base.oem,
+            members,
+        }
     }
 }
 

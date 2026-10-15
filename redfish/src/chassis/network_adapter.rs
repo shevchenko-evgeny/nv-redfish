@@ -24,14 +24,19 @@ use crate::schema::network_adapter::NetworkAdapter as NetworkAdapterSchema;
 use crate::schema::network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
 use nv_redfish_core::Bmc;
+use nv_redfish_core::EntityTypeRef as _;
+use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::NavProperty;
+use nv_redfish_core::RedfishSettings as _;
 use std::sync::Arc;
+
+pub use crate::schema::network_adapter::NetworkAdapterUpdate;
 
 #[cfg(feature = "network-device-functions")]
 use crate::network_device_function::NetworkDeviceFunctionCollection;
+#[cfg(feature = "oem-nvidia")]
+use crate::oem::nvidia::NvidiaNetworkAdapter;
 #[cfg(feature = "ports")]
 use crate::port::PortCollection;
 
@@ -146,6 +151,56 @@ impl<B: Bmc> NetworkAdapter<B> {
         }
     }
 
+    /// Get the advertised network adapter settings object.
+    ///
+    /// Returns `Ok(None)` when this adapter does not advertise
+    /// `@Redfish.Settings`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching the settings object fails.
+    pub async fn settings(&self) -> Result<Option<Self>, Error<B>> {
+        match self.data.settings_object() {
+            Some(settings) => Self::new(&self.bmc, &settings).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Update this network adapter resource.
+    ///
+    /// Call this method on the handle returned by [`Self::settings`] when
+    /// the service advertises `@Redfish.Settings`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating the network adapter fails.
+    pub async fn update(
+        &self,
+        update: &NetworkAdapterUpdate,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        self.bmc
+            .update::<_, NavProperty<NetworkAdapterSchema>>(
+                self.data.odata_id(),
+                self.data.etag(),
+                update,
+            )
+            .await?
+            .try_map_entity_async(|nav| async move { Self::new(&self.bmc, &nav).await })
+            .await
+    }
+
+    /// Get the NVIDIA OEM extension of this adapter.
+    ///
+    /// Returns `Ok(None)` when the adapter does not include `Oem.Nvidia`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if parsing the NVIDIA extension fails.
+    #[cfg(feature = "oem-nvidia")]
+    pub fn oem_nvidia(&self) -> Result<Option<NvidiaNetworkAdapter<B>>, Error<B>> {
+        NvidiaNetworkAdapter::new(&self.bmc, &self.data)
+    }
+
     /// Get network device functions for this adapter.
     ///
     /// Returns `Ok(None)` when the network device functions link is absent.
@@ -180,11 +235,5 @@ impl<B: Bmc> NetworkAdapter<B> {
         } else {
             Ok(None)
         }
-    }
-}
-
-impl<B: Bmc> Resource for NetworkAdapter<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
     }
 }

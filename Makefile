@@ -4,8 +4,6 @@
 
 pwd := $(shell pwd)
 
-maybe-lenovo-check = $(if $(wildcard $(pwd)/oem/lenovo/*.xml),cargo check --features oem-lenovo)
-
 space := $(empty) $(empty)
 comma :=,
 indent := $(empty)	$(empty)
@@ -20,9 +18,13 @@ all-std-features = accounts \
                    assembly \
                    bios \
                    boot-options \
+                   certificates \
                    chassis \
+                   component-integrity \
                    computer-systems \
                    ethernet-interfaces \
+                   fabrics \
+                   job-service \
                    log-services \
                    managers \
                    manager-network-protocol \
@@ -34,6 +36,7 @@ all-std-features = accounts \
                    power-supplies \
                    processors \
                    secure-boot \
+                   serial-interfaces \
                    sensors \
                    session-service \
                    storages \
@@ -56,6 +59,7 @@ std-not-standalone-features = assembly \
              power-supplies \
              secure-boot \
              sensors \
+             serial-interfaces \
              storages \
              update-service-deprecated
 
@@ -83,14 +87,37 @@ compile-only-feature-sets = computer-systems,processors,controls \
              oem-hpe,accounts \
              oem-hpe \
              oem-nvidia \
+             fabrics,oem-nvidia \
+             fabrics,ports,oem-nvidia \
+             chassis,fabrics \
+             managers,fabrics \
+             std-redfish,oem-nvidia \
+             oem-nvidia-fabrics \
+             fabrics,oem-nvidia-fabrics \
              computer-systems,oem-nvidia \
+             managers,oem-nvidia \
              chassis,oem-nvidia \
+             chassis,network-adapters,oem-nvidia \
              computer-systems,processors,memory,sensors,telemetry-service,oem-nvidia \
              telemetry-service \
              environment-metrics,memory,oem-nvidia \
              oem-dell \
              oem-ami \
+             managers,oem-ami \
+             update-service,oem-ami \
+             oem-lenovo \
+             accounts,oem-lenovo \
+             computer-systems,oem-lenovo \
+             managers,oem-lenovo \
+             chassis,network-adapters,ports,oem-lenovo \
+             accounts,oem-dell \
+             accounts,managers,oem-dell \
+             managers,oem-dell \
              managers,oem-dell-attributes \
+             computer-systems,storages,oem-dell \
+             job-service,oem-dell \
+             managers,job-service,oem-dell \
+             managers,job-service,oem-dell,oem-dell-attributes \
              $(std-standalone-features) \
              ""
 
@@ -103,7 +130,6 @@ define build-and-test
 	cargo clippy -p nv-redfish-dispatcher --all-targets --all-features
 	cargo clippy -p nv-redfish-bmc-http --bench cache
 	$(foreach f,$(compile-only-feature-sets),$(call check-one-feature,$f))
-	$(maybe-lenovo-check)
 	cargo check -p nv-redfish
 	cargo check -p nv-redfish-bmc-http --no-default-features --features http-extras
 	cargo check -p nv-redfish-tests --tests

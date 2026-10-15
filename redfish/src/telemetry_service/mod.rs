@@ -29,8 +29,6 @@ use crate::schema::telemetry_service::TelemetryService as TelemetryServiceSchema
 use crate::schema::telemetry_service::TelemetryServiceUpdate;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
 use crate::ServiceRoot;
 use nv_redfish_core::Bmc;
 use nv_redfish_core::EntityTypeRef as _;
@@ -113,14 +111,12 @@ impl<B: Bmc> TelemetryService<B> {
             .build();
 
         self.bmc
-            .as_ref()
             .update::<_, NavProperty<TelemetryServiceSchema>>(
                 self.data.odata_id(),
                 self.data.etag(),
                 &update,
             )
-            .await
-            .map_err(Error::Bmc)?
+            .await?
             .try_map_entity_async(|nav| async move {
                 let data = nav.get(self.bmc.as_ref()).await.map_err(Error::Bmc)?;
 
@@ -281,11 +277,5 @@ impl<B: Bmc> TelemetryService<B> {
                 MetricReportDefinition::new(&self.bmc, &nav).await
             })
             .await
-    }
-}
-
-impl<B: Bmc> Resource for TelemetryService<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
     }
 }

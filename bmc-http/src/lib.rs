@@ -59,8 +59,10 @@ use crate::cache::TypeErasedCarCache;
 
 use http::HeaderMap;
 use nv_redfish_core::query::ExpandQuery;
+use nv_redfish_core::without_event_ids;
 use nv_redfish_core::Action;
 use nv_redfish_core::Bmc;
+use nv_redfish_core::BmcError;
 use nv_redfish_core::BoxTryStream;
 use nv_redfish_core::EntityTypeRef;
 use nv_redfish_core::Expandable;
@@ -69,6 +71,7 @@ use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::ODataETag;
 use nv_redfish_core::ODataId;
 use nv_redfish_core::SessionCreateResponse;
+use nv_redfish_core::StreamEvent;
 use nv_redfish_core::UploadReader;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use url::Url;
@@ -94,7 +97,7 @@ pub use nv_redfish_core::MultipartUpdateRequest;
 /// implements this [`HttpClient`] trait.
 pub trait HttpClient: Send + Sync {
     /// HTTP client error.
-    type Error: Send + StdError;
+    type Error: BmcError;
 
     /// Perform an HTTP GET request with optional conditional headers.
     fn get<T>(
@@ -104,6 +107,16 @@ pub trait HttpClient: Send + Sync {
         etag: Option<ODataETag>,
         custom_headers: &HeaderMap,
     ) -> impl Future<Output = Result<T, Self::Error>> + Send
+    where
+        T: DeserializeOwned + Send + Sync;
+
+    /// Perform a GET on a URI of an asynchronous operation.
+    fn poll<T>(
+        &self,
+        url: Url,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+    ) -> impl Future<Output = Result<ModificationResponse<T>, Self::Error>> + Send
     where
         T: DeserializeOwned + Send + Sync;
 
@@ -194,6 +207,30 @@ pub trait HttpClient: Send + Sync {
         credentials: &BmcCredentials,
         custom_headers: &HeaderMap,
     ) -> impl Future<Output = Result<BoxTryStream<T, Self::Error>, Self::Error>> + Send;
+
+    /// Open an SSE stream whose events carry their ids, resuming after
+    /// `last_event_id` when one is given.
+    ///
+    /// The default forwards to [`HttpClient::sse`]: its events carry no id
+    /// and nothing is sent to resume from. A client that surfaces SSE ids
+    /// overrides it.
+    fn sse_events<T: Sized + for<'de> Deserialize<'de> + Send + 'static>(
+        &self,
+        url: Url,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+        last_event_id: Option<&str>,
+    ) -> impl Future<Output = Result<BoxTryStream<StreamEvent<T>, Self::Error>, Self::Error>> + Send
+    where
+        Self::Error: 'static,
+    {
+        let _ = last_event_id;
+        async move {
+            self.sse::<T>(url, credentials, custom_headers)
+                .await
+                .map(without_event_ids)
+        }
+    }
 }
 
 /// HTTP-based BMC implementation that wraps an [`HttpClient`].
@@ -641,7 +678,7 @@ where
 
 impl<C: HttpClient> Bmc for HttpBmc<C>
 where
-    C::Error: CacheableError + RequestError + StdError + Send + Sync,
+    C::Error: CacheableError + RequestError,
 {
     type Error = C::Error;
 
@@ -823,6 +860,45 @@ where
         let credentials = self.read_credentials();
         self.client
             .sse(endpoint_url, credentials.as_ref(), &self.custom_headers)
+            .await
+    }
+
+    async fn stream_events<T: Send + Sized + for<'de> Deserialize<'de> + 'static>(
+        &self,
+        uri: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<BoxTryStream<StreamEvent<T>, Self::Error>, Self::Error>
+    where
+        C::Error: 'static,
+    {
+        let endpoint_url = self
+            .redfish_endpoint
+            .with_same_origin_uri_reference(UriReference(uri))
+            .map_err(C::Error::rejected_uri_reference)?;
+
+        let credentials = self.read_credentials();
+        self.client
+            .sse_events(
+                endpoint_url,
+                credentials.as_ref(),
+                &self.custom_headers,
+                last_event_id,
+            )
+            .await
+    }
+
+    async fn poll<R: Send + Sync + for<'de> Deserialize<'de>>(
+        &self,
+        uri: &ODataId,
+    ) -> Result<ModificationResponse<R>, Self::Error> {
+        let uri = uri.to_string();
+        let endpoint_url = self
+            .redfish_endpoint
+            .with_same_origin_uri_reference(UriReference(&uri))
+            .map_err(C::Error::rejected_uri_reference)?;
+        let credentials = self.read_credentials();
+        self.client
+            .poll(endpoint_url, credentials.as_ref(), &self.custom_headers)
             .await
     }
 }

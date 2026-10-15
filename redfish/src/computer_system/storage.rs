@@ -20,13 +20,22 @@ use crate::patch_support::CollectionWithPatch;
 use crate::schema::resource::ResourceCollection;
 use crate::schema::storage::Storage as StorageSchema;
 use crate::schema::storage_collection::StorageCollection as StorageCollectionSchema;
+use crate::schema::volume::Volume as VolumeSchema;
+use crate::schema::volume::VolumeCreate;
+use crate::schema::volume_collection::VolumeCollection as VolumeCollectionSchema;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
+use nv_redfish_core::AsyncTask;
 use nv_redfish_core::Bmc;
+use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::NavProperty;
+use nv_redfish_core::ODataId;
+use nv_redfish_core::ReferenceLeaf;
+use std::marker::PhantomData;
 use std::sync::Arc;
+
+#[cfg(feature = "oem-dell")]
+use crate::oem::dell::DellStorageActions;
 
 /// Represents a storage controller in a computer system.
 ///
@@ -81,11 +90,149 @@ impl<B: Bmc> Storage<B> {
             Ok(None)
         }
     }
+
+    /// Get the advertised volume collection.
+    #[must_use]
+    pub fn volumes(&self) -> Option<VolumeCollection<B>> {
+        self.data
+            .volumes
+            .as_ref()
+            .map(|volumes| VolumeCollection::new(&self.bmc, volumes))
+    }
+
+    /// Get Dell OEM actions advertised by this storage controller.
+    ///
+    /// Returns `Ok(None)` when the resource has no OEM actions object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Dell OEM actions cannot be parsed.
+    #[cfg(feature = "oem-dell")]
+    pub fn oem_dell_actions(&self) -> Result<Option<DellStorageActions<B>>, Error<B>> {
+        self.data
+            .actions
+            .as_ref()
+            .and_then(|actions| actions.oem.as_ref())
+            .map(|actions| DellStorageActions::new(&self.bmc, actions))
+            .transpose()
+    }
 }
 
-impl<B: Bmc> Resource for Storage<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
+/// A standard Redfish Volume resource.
+pub struct Volume<B: Bmc> {
+    data: Arc<VolumeSchema>,
+    _marker: PhantomData<B>,
+}
+
+impl<B: Bmc> Volume<B> {
+    /// Wrap generated Volume data.
+    pub(crate) const fn from_data(data: Arc<VolumeSchema>) -> Self {
+        Self {
+            data,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Get the raw Volume schema.
+    #[must_use]
+    pub fn raw(&self) -> Arc<VolumeSchema> {
+        self.data.clone()
+    }
+}
+
+/// A standard Redfish Volume collection.
+pub struct VolumeCollection<B: Bmc> {
+    bmc: NvBmc<B>,
+    id: ODataId,
+}
+
+impl<B: Bmc> VolumeCollection<B> {
+    /// Create a collection handle from an advertised navigation property.
+    fn new(bmc: &NvBmc<B>, collection: &NavProperty<VolumeCollectionSchema>) -> Self {
+        Self {
+            bmc: bmc.clone(),
+            id: collection.id().clone(),
+        }
+    }
+
+    /// Get the advertised collection identifier.
+    #[must_use]
+    pub const fn odata_id(&self) -> &ODataId {
+        &self.id
+    }
+
+    /// Fetch every Volume in the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the collection or a member cannot be fetched.
+    pub async fn members(&self) -> Result<Vec<Volume<B>>, Error<B>> {
+        let collection = NavProperty::<VolumeCollectionSchema>::new_reference(self.id.clone())
+            .get(self.bmc.as_ref())
+            .await
+            .map_err(Error::Bmc)?;
+        let mut volumes = Vec::with_capacity(collection.members.len());
+        for member in &collection.members {
+            let data = member.get(self.bmc.as_ref()).await.map_err(Error::Bmc)?;
+            volumes.push(Volume::from_data(data));
+        }
+        Ok(volumes)
+    }
+
+    /// Create a standard Redfish Volume.
+    ///
+    /// Embedded entities are used directly.  A Location-only response is
+    /// resolved with a follow-up GET.  On iDRAC, which may answer with the
+    /// job that builds the volume, the response is read only as a reference:
+    /// a member of this collection is fetched, any other is returned as a
+    /// task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the BMC rejects the request or a returned reference
+    /// cannot be resolved.
+    pub async fn create(
+        &self,
+        request: &VolumeCreate,
+    ) -> Result<ModificationResponse<Volume<B>>, Error<B>> {
+        if self.bmc.quirks.bug_job_location_in_create_response() {
+            let response = self
+                .bmc
+                .as_ref()
+                .create::<_, ReferenceLeaf>(&self.id, request)
+                .await
+                .map_err(Error::Bmc)?;
+            if let ModificationResponse::Entity(reference) = &response {
+                let location = &reference.odata_id;
+                if *location == self.id || !self.id.is_path_prefix(location) {
+                    return Ok(ModificationResponse::Task(AsyncTask {
+                        location: location.clone().into(),
+                        retry_after: None,
+                    }));
+                }
+            }
+            return response
+                .try_map_entity_async(|reference| async move {
+                    NavProperty::<VolumeSchema>::new_reference(reference.odata_id)
+                        .get(self.bmc.as_ref())
+                        .await
+                        .map(Volume::from_data)
+                        .map_err(Error::Bmc)
+                })
+                .await;
+        }
+        self.bmc
+            .as_ref()
+            .create::<_, NavProperty<VolumeSchema>>(&self.id, request)
+            .await
+            .map_err(Error::Bmc)?
+            .try_map_entity_async(|nav| async move {
+                nav.get(self.bmc.as_ref())
+                    .await
+                    .map(Volume::from_data)
+                    .map_err(Error::Bmc)
+            })
+            .await
     }
 }
 
@@ -134,6 +281,15 @@ impl<B: Bmc> CollectionWithPatch<StorageCollectionSchema, StorageSchema, B>
         base: ResourceCollection,
         members: Vec<NavProperty<StorageSchema>>,
     ) -> StorageCollectionSchema {
-        StorageCollectionSchema { base, members }
+        StorageCollectionSchema {
+            odata_id: base.odata_id,
+            odata_etag: base.odata_etag,
+            odata_type: base.odata_type,
+            settings_annotations: base.settings_annotations,
+            description: base.description,
+            name: base.name,
+            oem: base.oem,
+            members,
+        }
     }
 }

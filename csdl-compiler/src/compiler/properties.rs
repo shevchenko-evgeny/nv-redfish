@@ -84,7 +84,9 @@ impl<'a> Properties<'a> {
                             .map_err(|e| Error::Property(&sp.name, e))?;
                         p.properties.push(Property {
                             name: &v.name,
-                            ptype: v.ptype.as_ref().map(|t| (typeinfo, t.into())),
+                            // Keep the property pointing at the type compiled above.
+                            // The declared base may be empty and pruned later.
+                            ptype: v.ptype.as_ref().map(|_| (typeinfo, resolved)),
                             odata: OData::new(MustHaveId::new(false), v),
                             redfish: RedfishProperty::new(v),
                             nullable: v.nullable.unwrap_or(IsNullable::new(true)),
@@ -260,13 +262,15 @@ impl TypeInfo {
                     // navigation properties. RequiredOnCreate above keeps
                     // create payload shapes writable even when the type is
                     // otherwise read-only.
-                    if ct.odata.additional_properties.is_none_or(|v| {
-                        // Redfish-specific heuristic: treat additional
-                        // properties of `OemActions` complex types as
-                        // read-only; we do this because the schema does not indicate their
-                        // immutability.
-                        !v.into_inner() || ct.name.name.inner().as_str() == "OemActions"
-                    }) && (ct.properties.is_empty() || structural_properties_are_read_only)
+                    if ct.redfish.dynamic_properties.is_none()
+                        && ct.odata.additional_properties.is_none_or(|v| {
+                            // Redfish-specific heuristic: treat additional
+                            // properties of `OemActions` complex types as
+                            // read-only; we do this because the schema does not indicate their
+                            // immutability.
+                            !v.into_inner() || ct.name.name.inner().as_str() == "OemActions"
+                        })
+                        && (ct.properties.is_empty() || structural_properties_are_read_only)
                     {
                         Some(Permissions::Read)
                     } else {

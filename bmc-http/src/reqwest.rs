@@ -36,9 +36,12 @@ use bytes::Bytes;
 use futures_util::stream::unfold;
 use futures_util::Stream;
 use futures_util::StreamExt as _;
+use futures_util::TryStreamExt as _;
 use http::header;
 use http::HeaderMap;
+use nv_redfish_core::ActionError;
 use nv_redfish_core::AsyncTask;
+use nv_redfish_core::BmcErrorClass;
 use nv_redfish_core::BoxTryStream;
 use nv_redfish_core::DataStream;
 use nv_redfish_core::ModificationResponse;
@@ -46,6 +49,7 @@ use nv_redfish_core::ODataETag;
 use nv_redfish_core::ODataId;
 use nv_redfish_core::OemMultipartPart;
 use nv_redfish_core::SessionCreateResponse;
+use nv_redfish_core::StreamEvent;
 use nv_redfish_core::UploadReader;
 #[cfg(feature = "update-service-deprecated")]
 use nv_redfish_core::UploadStream;
@@ -100,6 +104,8 @@ pub enum BmcError {
         /// Idle duration that elapsed with no event.
         idle: Duration,
     },
+    /// The service does not advertise the requested action.
+    ActionNotSupported,
 }
 
 impl From<reqwest::Error> for BmcError {
@@ -128,6 +134,12 @@ impl CacheableError for BmcError {
 impl RequestError for BmcError {
     fn rejected_uri_reference(error: RejectedUriReferenceError) -> Self {
         Self::InvalidRequest(error.reason)
+    }
+}
+
+impl ActionError for BmcError {
+    fn not_supported() -> Self {
+        Self::ActionNotSupported
     }
 }
 
@@ -161,6 +173,7 @@ impl fmt::Display for BmcError {
             Self::SseIdleTimeout { idle } => {
                 write!(f, "SSE stream idle for longer than {idle:?}")
             }
+            Self::ActionNotSupported => write!(f, "Action is not supported by the service"),
         }
     }
 }
@@ -173,6 +186,19 @@ impl StdErr for BmcError {
             Self::SseStreamError(e) => Some(e),
             Self::DecodeError(e) | Self::EncodeError(e) => Some(e),
             _ => None,
+        }
+    }
+}
+
+impl nv_redfish_core::BmcError for BmcError {
+    fn error_class(&self) -> BmcErrorClass {
+        match self {
+            Self::InvalidResponse { status, .. } => BmcErrorClass::HttpResponse {
+                status: status.as_u16(),
+            },
+            Self::JsonError(_) | Self::DecodeError(_) => BmcErrorClass::ResponseParse,
+            Self::ReqwestError(_) => BmcErrorClass::Transport,
+            _ => BmcErrorClass::Other,
         }
     }
 }
@@ -293,18 +319,45 @@ fn cap_event_bytes(
     })
 }
 
-/// Decode one SSE record into a typed item, or `None` for records without data
-/// (e.g. comments) so they are filtered out of the stream.
-fn event_to_item<T: DeserializeOwned>(
-    event: Result<sse_stream::Sse, sse_stream::Error>,
+/// The header a client sends to resume a stream after the last event it saw.
+const LAST_EVENT_ID: header::HeaderName = header::HeaderName::from_static("last-event-id");
+
+/// Decodes one SSE frame's `data` into an item. A frame without `data` is no
+/// item; one whose data fails to decode is an error item.
+fn decode_frame<T: DeserializeOwned>(
+    frame: Result<sse_stream::Sse, BmcError>,
 ) -> Option<Result<T, BmcError>> {
-    match event {
-        Err(err) => Some(Err(map_sse_error(err))),
+    match frame {
+        Err(err) => Some(Err(err)),
         Ok(sse) => sse.data.map(|data| {
             serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_str(&data))
                 .map_err(BmcError::JsonError)
         }),
     }
+}
+
+/// [`decode_frame`] with the last event id tracked across frames as the SSE
+/// processing model prescribes: a frame's `id` field sets it, an empty one
+/// clears it, one holding a NUL is ignored, and a frame without one leaves
+/// it, so the id on an item is the one to resume after it.
+fn event_to_item<T: DeserializeOwned>(
+    last_event_id: &mut Option<String>,
+    frame: Result<sse_stream::Sse, BmcError>,
+) -> Option<Result<StreamEvent<T>, BmcError>> {
+    if let Ok(sse) = &frame {
+        match &sse.id {
+            Some(id) if id.contains('\0') => {}
+            Some(id) if id.is_empty() => *last_event_id = None,
+            Some(id) => *last_event_id = Some(id.clone()),
+            None => {}
+        }
+    }
+    decode_frame::<T>(frame).map(|item| {
+        item.map(|data| StreamEvent {
+            last_event_id: last_event_id.clone(),
+            data,
+        })
+    })
 }
 
 /// Classifier deciding whether a response should be retried.
@@ -449,8 +502,10 @@ pub struct SseOptions {
     /// [`Client::sse`] aborts with [`BmcError::SseEventTooLarge`]. Guards against
     /// a server that never sends the SSE event terminator.
     pub max_event_bytes: usize,
-    /// Maximum idle time between SSE events before [`Client::sse`] aborts with
-    /// [`BmcError::SseIdleTimeout`]. `None` disables the check.
+    /// Maximum idle time between SSE frames before the stream aborts with
+    /// [`BmcError::SseIdleTimeout`]. A frame is an event, or one carrying
+    /// only an `id` or `event` field; comment heartbeats do not count.
+    /// `None` disables the check.
     pub idle_timeout: Option<Duration>,
 }
 
@@ -750,7 +805,10 @@ impl Client {
 
         let etag_header = etag_from_headers(&headers);
 
-        let mut value: serde_json::Value = response.json().await.map_err(BmcError::ReqwestError)?;
+        let body = response.bytes().await.map_err(BmcError::ReqwestError)?;
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(BmcError::DecodeError)?;
         value = patch_inflight(value);
 
         if let Some(etag) = etag_header {
@@ -758,6 +816,42 @@ impl Client {
         }
 
         serde_path_to_error::deserialize(value).map_err(BmcError::JsonError)
+    }
+
+    /// Read a response to polling an asynchronous operation.
+    ///
+    /// Pending responses often omit `Location`, which keeps the polled URI.
+    /// Finished responses are read like modification responses, and a `204`
+    /// naming a `Location` is read like an empty `200` with one.
+    async fn handle_poll_response<T>(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<ModificationResponse<T>, BmcError>
+    where
+        T: DeserializeOwned + Send + Sync,
+    {
+        let status = response.status();
+        let url = response.url();
+        let headers = response.headers();
+        match status {
+            reqwest::StatusCode::ACCEPTED => {
+                let location = location_from_headers(headers, url, status)?
+                    .unwrap_or_else(|| odata_path_from_url(url).into());
+                Ok(ModificationResponse::Task(AsyncTask {
+                    location: location.into(),
+                    retry_after: retry_after_from_headers(headers),
+                }))
+            }
+            reqwest::StatusCode::NO_CONTENT => location_from_headers(headers, url, status)?.map_or(
+                Ok(ModificationResponse::Empty),
+                |location| {
+                    serde_path_to_error::deserialize(serde_json::json!({ "@odata.id": location }))
+                        .map(ModificationResponse::Entity)
+                        .map_err(BmcError::JsonError)
+                },
+            ),
+            _ => self.handle_modification_response(response).await,
+        }
     }
 
     async fn handle_modification_response<T>(
@@ -782,7 +876,7 @@ impl Client {
 
         // Resolve the header once, but defer propagating its error until a
         // status branch actually uses Location. A malformed, irrelevant
-        // Location must not turn a valid 204 or body-bearing 200/201 into an
+        // Location must not turn a valid 204 or entity-bearing 200/201 into an
         // error.
         let location = location_from_headers(&headers, &url, status);
 
@@ -826,7 +920,17 @@ impl Client {
                         Ok(entity) => Ok(ModificationResponse::Entity(entity)),
                         Err(err) => {
                             if is_redfish_success_response(&value) {
-                                // No-response action returned a Redfish success envelope.
+                                // A success envelope is not the requested
+                                // representation. Preserve an accompanying
+                                // resource Location in the same way as an
+                                // empty 200/201 response.
+                                if let Some(location) = location? {
+                                    let value = serde_json::json!({ "@odata.id": location });
+                                    return Ok(serde_path_to_error::deserialize(value)
+                                        .map_or(ModificationResponse::Empty, |entity| {
+                                            ModificationResponse::Entity(entity)
+                                        }));
+                                }
                                 Ok(ModificationResponse::Empty)
                             } else {
                                 // The response was successful JSON, but it did
@@ -999,16 +1103,20 @@ fn location_from_headers(
         ));
     }
 
-    let mut path_and_query = resolved.path().to_string();
+    Ok(Some(odata_path_from_url(&resolved).into()))
+}
+
+fn odata_path_from_url(url: &Url) -> String {
+    let mut path_and_query = url.path().to_string();
 
     // Preserve the query separately from the path so later polling or deletion
     // sends it as a query instead of percent-encoded path text.
-    if let Some(query) = resolved.query() {
+    if let Some(query) = url.query() {
         path_and_query.push('?');
         path_and_query.push_str(query);
     }
 
-    Ok(Some(path_and_query.into()))
+    path_and_query
 }
 
 fn auth_token_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -1105,6 +1213,21 @@ impl HttpClient for Client {
 
         let response = self.send(request.build()?).await?;
         self.handle_response(response).await
+    }
+
+    async fn poll<T>(
+        &self,
+        url: Url,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+    ) -> Result<ModificationResponse<T>, Self::Error>
+    where
+        T: DeserializeOwned + Send + Sync,
+    {
+        let request =
+            auth_headers(self.inner.get(url), credentials).headers(custom_headers.clone());
+        let response = self.send(request.build()?).await?;
+        self.handle_poll_response(response).await
     }
 
     async fn post<B, T>(
@@ -1271,20 +1394,80 @@ impl HttpClient for Client {
         self.handle_modification_response(response).await
     }
 
-    // The idle branch matches on `Option<Duration>` where both arms await
-    // distinct future types, which cannot be expressed as an `Option` combinator
-    // without boxing; `option_if_let_else`'s suggestion does not apply.
-    #[allow(clippy::option_if_let_else)]
     async fn sse<T: Send + Sized + for<'de> serde::Deserialize<'de>>(
         &self,
         url: Url,
         credentials: &BmcCredentials,
         custom_headers: &HeaderMap,
     ) -> Result<BoxTryStream<T, Self::Error>, Self::Error> {
-        let request = auth_headers(self.inner.get(url), credentials)
+        let frames = self
+            .sse_frames(url, credentials, custom_headers, None)
+            .await?;
+        // Decoded in an async block rather than `ready(..)`: the boxed
+        // stream's type must not mention `T`, which the trait leaves without
+        // a `'static` bound.
+        Ok(Box::pin(frames.filter_map(|frame| async move {
+            decode_frame::<T>(frame)
+        })))
+    }
+
+    async fn sse_events<T: Send + Sized + for<'de> serde::Deserialize<'de> + 'static>(
+        &self,
+        url: Url,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+        last_event_id: Option<&str>,
+    ) -> Result<BoxTryStream<StreamEvent<T>, Self::Error>, Self::Error> {
+        // An empty id is no id, as the SSE processing model has it: none is
+        // sent, and none is in effect until the server sets one. Otherwise
+        // the resume id stays in effect across the reconnection, so events
+        // the server sends without an `id` field still carry it.
+        let last_event_id = last_event_id.filter(|id| !id.is_empty());
+        let frames = self
+            .sse_frames(url, credentials, custom_headers, last_event_id)
+            .await?;
+        let events = frames
+            .scan(last_event_id.map(str::to_owned), |last_event_id, frame| {
+                ready(Some(event_to_item::<T>(last_event_id, frame)))
+            })
+            .filter_map(ready);
+        Ok(Box::pin(events))
+    }
+}
+
+impl Client {
+    /// Opens the SSE request, `Last-Event-ID` set when resuming, and returns
+    /// its frames: decoded from a body capped at
+    /// [`SseOptions::max_event_bytes`] per event, ended after a fatal error,
+    /// and, when [`SseOptions::idle_timeout`] is set, failed when no frame
+    /// arrives within that window. The window is keyed on frames the server
+    /// sends, so comment heartbeats (which the decoder discards) do NOT reset
+    /// it; a server relying solely on comment heartbeats should not enable
+    /// the idle timeout.
+    // The idle branch matches on `Option<Duration>` where both arms await
+    // distinct future types, which cannot be expressed as an `Option`
+    // combinator without boxing; `option_if_let_else`'s suggestion does not
+    // apply.
+    #[allow(clippy::option_if_let_else)]
+    async fn sse_frames(
+        &self,
+        url: Url,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+        last_event_id: Option<&str>,
+    ) -> Result<BoxTryStream<sse_stream::Sse, BmcError>, BmcError> {
+        let mut request = auth_headers(self.inner.get(url), credentials)
             .headers(custom_headers.clone())
             .header(header::ACCEPT, "text/event-stream")
             .timeout(Duration::MAX);
+        if let Some(id) = last_event_id {
+            let value = header::HeaderValue::from_str(id).map_err(|_| {
+                BmcError::InvalidRequest(format!(
+                    "Last-Event-ID {id:?} cannot be sent as a header value"
+                ))
+            })?;
+            request = request.header(LAST_EVENT_ID, value);
+        }
 
         let response = self.send(request.build()?).await?;
 
@@ -1297,39 +1480,34 @@ impl HttpClient for Client {
         }
 
         let capped = cap_event_bytes(response.bytes_stream(), self.sse.max_event_bytes);
-        let events = sse_stream::SseStream::from_bytes_stream(capped)
-            .filter_map(|event| async move { event_to_item::<T>(event) });
+        let frames = sse_stream::SseStream::from_bytes_stream(capped).map_err(map_sse_error);
 
-        // Liveness bound: optionally abort if no event arrives within the idle
-        // window. It is keyed on decoded events, so comment heartbeats (which
-        // `sse_stream` discards) do NOT reset it; a server relying solely on
-        // comment heartbeats should not enable the idle timeout.
         let idle = self.sse.idle_timeout;
-        let guarded = unfold(
-            (Box::pin(events), false),
-            move |(mut events, done)| async move {
+        let bounded = unfold(
+            (Box::pin(frames), false),
+            move |(mut frames, done)| async move {
                 if done {
                     return None;
                 }
                 let next = match idle {
-                    Some(d) => match timeout(d, events.next()).await {
-                        Ok(item) => item,
+                    Some(d) => match timeout(d, frames.next()).await {
+                        Ok(frame) => frame,
                         Err(_) => Some(Err(BmcError::SseIdleTimeout { idle: d })),
                     },
-                    None => events.next().await,
+                    None => frames.next().await,
                 };
                 match next {
                     Some(Err(e)) => {
                         let terminal = e.is_stream_fatal();
-                        Some((Err(e), (events, terminal)))
+                        Some((Err(e), (frames, terminal)))
                     }
-                    Some(ok) => Some((ok, (events, false))),
+                    Some(ok) => Some((ok, (frames, false))),
                     None => None,
                 }
             },
         );
 
-        Ok(Box::pin(guarded))
+        Ok(Box::pin(bounded))
     }
 }
 
@@ -1393,6 +1571,9 @@ mod tests {
 
     use futures_util::io::Cursor;
     use http::HeaderValue;
+    use nv_redfish_core::BmcError as _;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
     use wiremock::matchers::header;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
@@ -1518,6 +1699,93 @@ mod tests {
 
         let created_miss = BmcError::cache_miss();
         assert!(matches!(created_miss, BmcError::CacheMiss));
+    }
+    #[tokio::test]
+    async fn client_classifies_absent_resources_and_response_parse_failures() {
+        let client = Client::new().expect("test client must be created");
+
+        for (status, expected) in [
+            (
+                reqwest::StatusCode::NOT_FOUND,
+                BmcErrorClass::HttpResponse { status: 404 },
+            ),
+            (
+                reqwest::StatusCode::GONE,
+                BmcErrorClass::HttpResponse { status: 410 },
+            ),
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                BmcErrorClass::HttpResponse { status: 401 },
+            ),
+        ] {
+            let response_error = BmcError::InvalidResponse {
+                url: "http://example.com/redfish/v1/Accounts/3"
+                    .parse()
+                    .expect("valid test URL"),
+                status,
+                text: String::new(),
+            };
+
+            assert_eq!(response_error.error_class(), expected);
+        }
+
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .body("not JSON")
+                .expect("valid test response"),
+        );
+
+        let decode_error = client
+            .handle_response::<serde_json::Value>(response)
+            .await
+            .expect_err("invalid JSON must fail to decode");
+
+        assert_eq!(decode_error.error_class(), BmcErrorClass::ResponseParse);
+
+        let transport_error = reqwest::Client::new()
+            .get("://")
+            .build()
+            .expect_err("invalid URL must fail request construction");
+
+        let transport_error = BmcError::ReqwestError(transport_error);
+
+        assert_eq!(transport_error.error_class(), BmcErrorClass::Transport);
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_body_is_transport() -> Result<(), Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                )
+                .await
+        });
+
+        let client = Client::new()?;
+        let credentials = BmcCredentials::username_password("user".into(), None);
+
+        let error = client
+            .get::<serde_json::Value>(
+                Url::parse(&format!("http://{address}"))?,
+                &credentials,
+                None,
+                &HeaderMap::new(),
+            )
+            .await
+            .expect_err("the truncated response body must fail");
+
+        server.await??;
+
+        assert_eq!(error.error_class(), BmcErrorClass::Transport);
+
+        Ok(())
     }
 
     #[tokio::test]

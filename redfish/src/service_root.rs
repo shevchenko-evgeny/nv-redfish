@@ -23,21 +23,25 @@ use crate::schema::service_root::ServiceRoot as SchemaServiceRoot;
 use crate::Error;
 use crate::NvBmc;
 use crate::ProtocolFeatures;
-use crate::Resource;
-use crate::ResourceSchema;
 
 use tagged_types::TaggedType;
 
 #[cfg(feature = "accounts")]
-use crate::account::AccountService;
+use crate::account::{AccountService, AccountServiceConfig};
 #[cfg(feature = "chassis")]
 use crate::chassis::ChassisCollection;
 #[cfg(feature = "chassis")]
 use crate::chassis::ChassisLink;
+#[cfg(feature = "component-integrity")]
+use crate::component_integrity::ComponentIntegrityCollection;
 #[cfg(feature = "computer-systems")]
 use crate::computer_system::SystemCollection;
 #[cfg(feature = "event-service")]
 use crate::event_service::EventService;
+#[cfg(feature = "fabrics")]
+use crate::fabric::FabricCollection;
+#[cfg(feature = "job-service")]
+use crate::job_service::JobService;
 #[cfg(feature = "managers")]
 use crate::manager::ManagerCollection;
 #[cfg(feature = "oem-ami")]
@@ -172,7 +176,7 @@ impl<B: Bmc> ServiceRoot<B> {
             .map(RedfishVersion::new)
     }
 
-    /// Get the account service belonging to the BMC.
+    /// Get the account service belonging to the BMC with immutable behavior.
     ///
     /// Returns `Ok(None)` when the BMC does not expose AccountService.
     ///
@@ -180,8 +184,11 @@ impl<B: Bmc> ServiceRoot<B> {
     ///
     /// Returns error if retrieving account service data fails.
     #[cfg(feature = "accounts")]
-    pub async fn account_service(&self) -> Result<Option<AccountService<B>>, Error<B>> {
-        AccountService::new(&self.bmc, self).await
+    pub async fn account_service(
+        &self,
+        config: AccountServiceConfig,
+    ) -> Result<Option<AccountService<B>>, Error<B>> {
+        AccountService::new(&self.bmc, self, config).await
     }
 
     /// Get chassis collection in BMC
@@ -194,6 +201,20 @@ impl<B: Bmc> ServiceRoot<B> {
     #[cfg(feature = "chassis")]
     pub async fn chassis(&self) -> Result<Option<ChassisCollection<B>>, Error<B>> {
         ChassisCollection::new(&self.bmc, self).await
+    }
+
+    /// Get the component-integrity collection advertised by this BMC.
+    ///
+    /// Returns `Ok(None)` when the BMC does not expose ComponentIntegrity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retrieving the collection fails.
+    #[cfg(feature = "component-integrity")]
+    pub async fn component_integrity(
+        &self,
+    ) -> Result<Option<ComponentIntegrityCollection<B>>, Error<B>> {
+        ComponentIntegrityCollection::new(&self.bmc, self).await
     }
 
     /// Get chassis links
@@ -236,6 +257,18 @@ impl<B: Bmc> ServiceRoot<B> {
         SystemCollection::new(&self.bmc, self).await
     }
 
+    /// Get fabric collection in BMC
+    ///
+    /// Returns `Ok(None)` when the BMC does not expose Fabrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if retrieving fabric collection data fails.
+    #[cfg(feature = "fabrics")]
+    pub async fn fabrics(&self) -> Result<Option<FabricCollection<B>>, Error<B>> {
+        FabricCollection::new(&self.bmc, self).await
+    }
+
     /// Get update service in BMC
     ///
     /// Returns `Ok(None)` when the BMC does not expose UpdateService.
@@ -246,6 +279,18 @@ impl<B: Bmc> ServiceRoot<B> {
     #[cfg(feature = "update-service")]
     pub async fn update_service(&self) -> Result<Option<UpdateService<B>>, Error<B>> {
         UpdateService::new(&self.bmc, self).await
+    }
+
+    /// Get JobService in BMC.
+    ///
+    /// Returns `Ok(None)` when the BMC does not expose JobService.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retrieving JobService data fails.
+    #[cfg(feature = "job-service")]
+    pub async fn job_service(&self) -> Result<Option<JobService<B>>, Error<B>> {
+        JobService::new(&self.bmc, self).await
     }
 
     /// Get task service in BMC
@@ -342,11 +387,5 @@ impl<B: Bmc> ServiceRoot<B> {
     #[cfg(feature = "oem-ami")]
     pub fn oem_ami_service_root(&self) -> Result<Option<AmiServiceRoot<B>>, Error<B>> {
         AmiServiceRoot::new(&self.bmc, &self.root)
-    }
-}
-
-impl<B: Bmc> Resource for ServiceRoot<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.root.as_ref().base
     }
 }

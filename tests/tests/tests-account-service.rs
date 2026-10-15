@@ -21,13 +21,24 @@ use std::time::Duration;
 
 use nv_redfish::account::AccountCollection;
 use nv_redfish::account::AccountService;
+use nv_redfish::account::AccountServiceConfig;
+use nv_redfish::account::AccountServiceUpdate;
 use nv_redfish::account::AccountTypes;
 use nv_redfish::account::ManagerAccountCreate;
 use nv_redfish::account::ManagerAccountUpdate;
+use nv_redfish::oem::dell::IdracVersion;
+use nv_redfish::oem::hpe::account_service::{
+    HpeAccountServiceUpdate, HpeAccountServiceUpdateExt as _,
+};
+use nv_redfish::oem::lenovo::account_service::LenovoAccountServiceUpdate;
+use nv_redfish::oem::lenovo::account_service::LenovoAccountServiceUpdateExt as _;
+use nv_redfish::schema::account_service::MfaBypassCreate;
+use nv_redfish::schema::manager_account::SnmpUserInfoCreate;
 use nv_redfish::ServiceRoot;
 use nv_redfish_core::AsyncTask;
 use nv_redfish_core::EntityTypeRef;
 use nv_redfish_core::ModificationResponse;
+use nv_redfish_core::NavProperty;
 use nv_redfish_core::ODataId;
 use nv_redfish_tests::json_merge;
 use nv_redfish_tests::Bmc;
@@ -67,7 +78,7 @@ async fn account_request_debug_redacts_passwords() {
         .build();
     let update_debug = format!("{update:?}");
     assert!(!update_debug.contains(SECRET));
-    assert!(update_debug.contains("base: None"));
+    assert!(update_debug.contains("oem: None"));
     assert!(update_debug.contains("password: Some(\"<redacted>\")"));
     assert!(update_debug.contains("user_name: Some(\"debug-user\")"));
     assert_eq!(
@@ -121,8 +132,8 @@ async fn list_accounts() -> Result<(), Box<dyn StdError>> {
     let account = accounts.first().unwrap().raw();
     assert_eq!(account.user_name, Some("Administrator".into()));
     assert_eq!(account.role_id, Some("AdministratorRole".into()));
-    assert_eq!(account.base.name, "User Account");
-    assert_eq!(account.base.id, "1");
+    assert_eq!(account.name, "User Account");
+    assert_eq!(account.id, "1");
     Ok(())
 }
 
@@ -176,10 +187,110 @@ async fn list_no_patch_accounts() -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
+#[test]
+async fn dpu_account_service_links_incomplete_certificate_collection() -> TestResult<()> {
+    // BlueField-3 BMC 3.4.1 inlines this collection without its required `Name`.
+    let payload = json!({
+        ODATA_ID: "/redfish/v1/AccountService",
+        ODATA_TYPE: "#AccountService.v1_15_0.AccountService",
+        "AccountLockoutDuration": 600,
+        "AccountLockoutThreshold": 10,
+        "Accounts": { ODATA_ID: "/redfish/v1/AccountService/Accounts" },
+        "Description": "Account Service",
+        "HTTPBasicAuth": "Enabled",
+        "Id": "AccountService",
+        "LDAP": {
+            "Certificates": { ODATA_ID: "/redfish/v1/AccountService/LDAP/Certificates" }
+        },
+        "MaxPasswordLength": 64,
+        "MinPasswordLength": 12,
+        "MultiFactorAuth": {
+            "ClientCertificate": {
+                "CertificateMappingAttribute": "CommonName",
+                "Certificates": {
+                    ODATA_ID: "/redfish/v1/AccountService/MultiFactorAuth/ClientCertificate/Certificates",
+                    ODATA_TYPE: "#CertificateCollection.CertificateCollection",
+                    "Members": [{
+                        ODATA_ID: "/redfish/v1/AccountService/MultiFactorAuth/ClientCertificate/Certificates/1"
+                    }],
+                    "Members@odata.count": 1
+                },
+                "Enabled": true,
+                "RespondToUnauthenticatedClients": true
+            }
+        },
+        "Name": "Account Service",
+        "Roles": { ODATA_ID: "/redfish/v1/AccountService/Roles" },
+        "ServiceEnabled": true
+    });
+
+    let bmc = Arc::new(Bmc::default());
+    let root = account_service_root(&bmc, "Nvidia", "BlueField-3 DPU").await?;
+    bmc.expect(Expect::get("/redfish/v1/AccountService", payload.clone()));
+    let service = root
+        .account_service(AccountServiceConfig::standard())
+        .await?
+        .expect("AccountService is advertised");
+    let raw = service.raw();
+    let certificates = raw
+        .multi_factor_auth
+        .as_ref()
+        .and_then(Option::as_ref)
+        .and_then(|mfa| mfa.client_certificate.as_ref())
+        .and_then(Option::as_ref)
+        .and_then(|client| client.certificates.as_ref())
+        .expect("client certificates are linked");
+    assert!(matches!(certificates, NavProperty::Reference(_)));
+
+    // Without the DPU quirk the incomplete collection fails to parse.
+    let bmc = Arc::new(Bmc::default());
+    let root = account_service_root(&bmc, "Contoso", "Server").await?;
+    bmc.expect(Expect::get("/redfish/v1/AccountService", payload));
+    assert!(root
+        .account_service(AccountServiceConfig::standard())
+        .await
+        .is_err());
+
+    Ok(())
+}
+
+async fn account_service_root(
+    bmc: &Arc<Bmc>,
+    vendor: &str,
+    product: &str,
+) -> TestResult<ServiceRoot<Bmc>> {
+    let root_id = ODataId::service_root();
+    bmc.expect(Expect::get(
+        &root_id,
+        json!({
+            ODATA_ID: &root_id,
+            ODATA_TYPE: "#ServiceRoot.v1_15_0.ServiceRoot",
+            "Id": "RootService",
+            "Name": "Root Service",
+            "Vendor": vendor,
+            "Product": product,
+            "AccountService": { ODATA_ID: "/redfish/v1/AccountService" },
+            "Links": {
+                "Sessions": { ODATA_ID: "/redfish/v1/SessionService/Sessions" }
+            }
+        }),
+    ));
+    Ok(ServiceRoot::new(bmc.clone()).await?)
+}
+
 async fn get_account_service(
     bmc: Arc<Bmc>,
     root_id: &ODataId,
     vendor: &str,
+) -> Result<AccountService<Bmc>, Box<dyn StdError>> {
+    get_account_service_with_config(bmc, root_id, vendor, AccountServiceConfig::standard()).await
+}
+
+async fn get_account_service_with_config(
+    bmc: Arc<Bmc>,
+    root_id: &ODataId,
+    vendor: &str,
+    config: AccountServiceConfig,
 ) -> Result<AccountService<Bmc>, Box<dyn StdError>> {
     let account_service_id = format!("{root_id}/AccountService");
     let data_type = "#ServiceRoot.v1_13_0.ServiceRoot";
@@ -222,7 +333,277 @@ async fn get_account_service(
             },
         }),
     ));
-    Ok(service_root.account_service().await?.unwrap())
+    Ok(service_root.account_service(config).await?.unwrap())
+}
+
+#[test]
+async fn update_sends_wildcard_if_match_on_ami_firmware() -> TestResult<()> {
+    let etag = "\"account-service-1\"";
+    for (name, root_fields, expected_etag) in [
+        (
+            "AMI",
+            json!({ "Vendor": "AMI", "RedfishVersion": "1.15.0" }),
+            None,
+        ),
+        (
+            "AMI Viking",
+            json!({ "Vendor": "AMI", "RedfishVersion": "1.11.0" }),
+            None,
+        ),
+        (
+            "AMI GB300",
+            json!({ "Vendor": "AMI", "Oem": { "Ami": { "RtpVersion": "13.09.1" } } }),
+            None,
+        ),
+        (
+            "Lenovo AMI",
+            json!({ "Vendor": "Lenovo", "Oem": { "Ami": {} } }),
+            None,
+        ),
+        ("Lenovo XCC", json!({ "Vendor": "Lenovo" }), Some(etag)),
+        ("Dell", json!({ "Vendor": "Dell" }), Some(etag)),
+    ] {
+        let bmc = Arc::new(Bmc::default());
+        let root_id = ODataId::service_root();
+        let service_id = format!("{root_id}/AccountService");
+        bmc.expect(Expect::get(
+            &root_id,
+            json_merge([
+                &json!({
+                    ODATA_ID: &root_id,
+                    ODATA_TYPE: "#ServiceRoot.v1_13_0.ServiceRoot",
+                    "Id": "RootService",
+                    "Name": "RootService",
+                    "AccountService": { ODATA_ID: &service_id },
+                    "Links": {
+                        "Sessions": { ODATA_ID: format!("{root_id}/SessionService/Sessions") }
+                    },
+                }),
+                &root_fields,
+            ]),
+        ));
+        let service_root = ServiceRoot::new(bmc.clone()).await?;
+        let service = json!({
+            ODATA_ID: &service_id,
+            ODATA_TYPE: ACCOUNT_SERVICE_DATA_TYPE,
+            "@odata.etag": etag,
+            "Id": "AccountService",
+            "Name": "AccountService",
+        });
+        bmc.expect(Expect::get(&service_id, &service));
+        let account_service = service_root
+            .account_service(AccountServiceConfig::standard())
+            .await?
+            .ok_or("missing account service")?;
+
+        let update = AccountServiceUpdate::builder()
+            .with_account_lockout_threshold(0)
+            .build();
+        bmc.expect(Expect::update_with_etag(
+            &service_id,
+            expected_etag,
+            json!({ "AccountLockoutThreshold": 0 }),
+            &service,
+        ));
+        let response = account_service
+            .update(&update)
+            .await
+            .map_err(|error| format!("{name}: {error}"))?;
+        assert!(
+            matches!(response, ModificationResponse::Entity(_)),
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+async fn update_account_service_preserves_uri_config_and_read_patch() -> TestResult<()> {
+    let bmc = Arc::new(Bmc::default());
+    let root_id = ODataId::service_root();
+    let account_service = get_account_service(bmc.clone(), &root_id, "HPE").await?;
+    let service_id = account_service.raw().odata_id().to_string();
+    let accounts_id = format!("{service_id}/Accounts");
+    let update = AccountServiceUpdate::builder()
+        .with_account_lockout_threshold(5)
+        .build();
+
+    bmc.expect(Expect::update(
+        &service_id,
+        serde_json::to_value(&update)?,
+        json!({
+            ODATA_ID: &service_id,
+            ODATA_TYPE: ACCOUNT_SERVICE_DATA_TYPE,
+            "Id": "AccountService",
+            "Name": "AccountService",
+            "AccountLockoutThreshold": 5,
+            "Accounts": { ODATA_ID: &accounts_id }
+        }),
+    ));
+
+    let updated = into_entity(account_service.update(&update).await?);
+    assert_eq!(updated.raw().account_lockout_threshold, Some(Some(5)));
+
+    bmc.expect(Expect::expand(
+        &accounts_id,
+        json!({
+            ODATA_ID: &accounts_id,
+            ODATA_TYPE: ACCOUNTS_DATA_TYPE,
+            "Name": "User Accounts",
+            "Members": [{
+                ODATA_ID: format!("{accounts_id}/1"),
+                ODATA_TYPE: MANAGER_ACCOUNT_DATA_TYPE,
+                "Id": "1",
+                "Name": "User Account",
+                "UserName": "patched-user"
+            }]
+        }),
+    ));
+
+    let accounts = updated
+        .accounts()
+        .await?
+        .ok_or("accounts collection missing")?;
+    let account = accounts
+        .all_accounts_data()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("account missing")?;
+    assert_eq!(
+        account.raw().account_types,
+        Some(vec![AccountTypes::Redfish])
+    );
+
+    Ok(())
+}
+
+#[test]
+async fn update_lenovo_account_policy_uses_typed_oem_payload() -> TestResult<()> {
+    let bmc = Arc::new(Bmc::default());
+    let root_id = ODataId::service_root();
+    let account_service = get_account_service(bmc.clone(), &root_id, "Lenovo").await?;
+    let service_id = account_service.raw().odata_id().to_string();
+    let accounts_id = format!("{service_id}/Accounts");
+    let update = lenovo_account_policy_update()?;
+    let request = json!({
+        "AccountLockoutThreshold": 0,
+        "AccountLockoutDuration": 60,
+        "Oem": {
+            "OtherVendor": { "Keep": true },
+            "Lenovo": {
+                "PasswordExpirationPeriodDays": 0.0,
+                "PasswordChangeOnFirstAccess": false,
+                "MinimumPasswordChangeIntervalHours": 0.0,
+                "MinimumPasswordReuseCycle": 0.0,
+                "PasswordExpirationWarningPeriod": 0.0
+            }
+        }
+    });
+    bmc.expect(Expect::update(
+        &service_id,
+        &request,
+        json!({
+            ODATA_ID: &service_id,
+            ODATA_TYPE: ACCOUNT_SERVICE_DATA_TYPE,
+            "Id": "AccountService",
+            "Name": "AccountService",
+            "Accounts": { ODATA_ID: &accounts_id }
+        }),
+    ));
+
+    let ModificationResponse::Entity(updated) = account_service.update(&update).await? else {
+        return Err("expected updated account service".into());
+    };
+    bmc.expect(Expect::update_empty(&service_id, &request));
+    assert_empty(updated.update(&update).await?);
+    Ok(())
+}
+
+#[test]
+async fn update_hpe_account_policy_composes_standard_and_oem_payloads() -> TestResult<()> {
+    let bmc = Arc::new(Bmc::default());
+    let root_id = ODataId::service_root();
+    let account_service = get_account_service(bmc.clone(), &root_id, "HPE").await?;
+    let service_id = account_service.raw().odata_id().to_string();
+    let accounts_id = format!("{service_id}/Accounts");
+    let hpe_update = HpeAccountServiceUpdate::builder()
+        .with_auth_failure_delay_time_seconds(2)
+        .with_auth_failure_logging_threshold(0)
+        .with_auth_failures_before_delay(0)
+        .with_enforce_password_complexity(false)
+        .build();
+    let update = AccountServiceUpdate::builder()
+        .with_account_lockout_threshold(0)
+        .with_min_password_length(8)
+        .with_oem(nv_redfish::schema::resource::OemUpdate {
+            additional_properties: json!({ "OtherVendor": { "Keep": true } }),
+        })
+        .build()
+        .with_oem_hpe(hpe_update)?;
+    let request = json!({
+        "AccountLockoutThreshold": 0,
+        "MinPasswordLength": 8,
+        "Oem": {
+            "OtherVendor": { "Keep": true },
+            "Hpe": {
+                "AuthFailureDelayTimeSeconds": 2,
+                "AuthFailureLoggingThreshold": 0,
+                "AuthFailuresBeforeDelay": 0,
+                "EnforcePasswordComplexity": false
+            }
+        }
+    });
+    bmc.expect(Expect::update(
+        &service_id,
+        &request,
+        json!({
+            ODATA_ID: &service_id,
+            ODATA_TYPE: ACCOUNT_SERVICE_DATA_TYPE,
+            "Id": "AccountService",
+            "Name": "AccountService",
+            "Accounts": { ODATA_ID: &accounts_id }
+        }),
+    ));
+
+    let ModificationResponse::Entity(updated) = account_service.update(&update).await? else {
+        return Err("expected updated account service".into());
+    };
+    bmc.expect(Expect::update_empty(&service_id, &request));
+    assert_empty(updated.update(&update).await?);
+    Ok(())
+}
+
+#[test]
+async fn hpe_account_policy_rejects_malformed_existing_oem_payload() {
+    let update = AccountServiceUpdate::builder()
+        .with_oem(nv_redfish::schema::resource::OemUpdate {
+            additional_properties: json!("not-an-object"),
+        })
+        .build();
+    let hpe = HpeAccountServiceUpdate::builder()
+        .with_auth_failure_logging_threshold(0)
+        .build();
+
+    assert!(update.with_oem_hpe(hpe).is_err());
+}
+
+fn lenovo_account_policy_update() -> Result<AccountServiceUpdate, serde_json::Error> {
+    let lenovo_update = LenovoAccountServiceUpdate::builder()
+        .with_password_expiration_period_days(0.0)
+        .with_password_change_on_first_access(false)
+        .with_minimum_password_change_interval_hours(0.0)
+        .with_minimum_password_reuse_cycle(0.0)
+        .with_password_expiration_warning_period(0.0)
+        .build();
+    AccountServiceUpdate::builder()
+        .with_account_lockout_threshold(0)
+        .with_account_lockout_duration(60)
+        .with_oem(nv_redfish::schema::resource::OemUpdate {
+            additional_properties: json!({ "OtherVendor": { "Keep": true } }),
+        })
+        .build()
+        .with_oem_lenovo(lenovo_update)
 }
 
 async fn get_account_collection(
@@ -269,9 +650,31 @@ async fn account_fixture(
     vendor: &str,
     slots: &[(u32, bool, &str)],
 ) -> TestResult<(Arc<Bmc>, String, AccountCollection<Bmc>)> {
+    account_fixture_with_config(vendor, slots, AccountServiceConfig::standard()).await
+}
+
+async fn slot_account_fixture(
+    slots: &[(u32, bool, &str)],
+) -> TestResult<(Arc<Bmc>, String, AccountCollection<Bmc>)> {
+    idrac_account_fixture(IdracVersion::IDRAC9, slots).await
+}
+
+async fn idrac_account_fixture(
+    version: IdracVersion,
+    slots: &[(u32, bool, &str)],
+) -> TestResult<(Arc<Bmc>, String, AccountCollection<Bmc>)> {
+    account_fixture_with_config("Dell", slots, version.account_service_config()).await
+}
+
+async fn account_fixture_with_config(
+    vendor: &str,
+    slots: &[(u32, bool, &str)],
+    config: AccountServiceConfig,
+) -> TestResult<(Arc<Bmc>, String, AccountCollection<Bmc>)> {
     let bmc = Arc::new(Bmc::default());
     let root_id = ODataId::service_root();
-    let account_service = get_account_service(bmc.clone(), &root_id, vendor).await?;
+    let account_service =
+        get_account_service_with_config(bmc.clone(), &root_id, vendor, config).await?;
     let accounts_id = format!("{}/Accounts", account_service.raw().odata_id());
 
     let members = JsonValue::Array(
@@ -283,7 +686,19 @@ async fn account_fixture(
             .collect(),
     );
 
-    let accounts = get_account_collection(bmc.clone(), &account_service, members).await?;
+    bmc.expect(Expect::expand(
+        &accounts_id,
+        json!({
+            ODATA_ID: &accounts_id,
+            ODATA_TYPE: &ACCOUNTS_DATA_TYPE,
+            "Name": "User Accounts",
+            "Members": members,
+        }),
+    ));
+    let accounts = account_service
+        .accounts()
+        .await?
+        .ok_or("accounts collection missing")?;
 
     Ok((bmc, accounts_id, accounts))
 }
@@ -360,8 +775,8 @@ async fn create_account_standard_preserves_all_response_variants() -> TestResult
 
     assert_eq!(account.user_name, Some("user".into()));
     assert_eq!(account.role_id, Some("Operator".into()));
-    assert_eq!(account.base.id, "1");
-    assert_eq!(account.base.name, "User Account");
+    assert_eq!(account.id, "1");
+    assert_eq!(account.name, "User Account");
     assert!(account.account_types.as_ref().is_some_and(Vec::is_empty));
 
     let task_id = "/redfish/v1/TaskService/Tasks/42";
@@ -382,6 +797,34 @@ async fn create_account_standard_preserves_all_response_variants() -> TestResult
     bmc.expect(Expect::create_empty(&accounts_id, create_json));
 
     assert_empty(accounts.create_account(create_req).await?);
+
+    Ok(())
+}
+
+#[test]
+async fn dell_standard_collection_uses_post_and_resource_delete() -> TestResult<()> {
+    let (bmc, accounts_id, accounts) = idrac_account_fixture(IdracVersion::IDRAC10, &[]).await?;
+    let account_id = format!("{accounts_id}/3");
+    let create = create_request("user");
+
+    bmc.expect(Expect::create(
+        &accounts_id,
+        serde_json::to_value(&create)?,
+        json!({
+            ODATA_ID: &account_id,
+            ODATA_TYPE: MANAGER_ACCOUNT_DATA_TYPE,
+            "Id": "3",
+            "Name": "User Account",
+            "UserName": "user",
+            "RoleId": "Operator",
+            "Enabled": true,
+            "AccountTypes": []
+        }),
+    ));
+    let account = into_entity(accounts.create_account(create).await?);
+
+    bmc.expect(Expect::delete(&account_id));
+    assert_empty(account.delete().await?);
 
     Ok(())
 }
@@ -415,18 +858,15 @@ async fn create_account_hpe_patched() -> TestResult<()> {
     Ok(())
 }
 
-// Create account (Dell slot-defined): choose first disabled slot with id >= min_slot (3).
+// Create account in fixed slots: choose the lowest disabled slot in 3..=16.
 #[test]
 async fn create_account_dell_slot_defined_first_available() -> TestResult<()> {
-    let (bmc, accounts_id, accounts) = account_fixture(
-        "Dell",
-        &[
-            (1, true, "root"),
-            (2, false, ""),
-            (3, false, ""),
-            (4, false, ""),
-        ],
-    )
+    let (bmc, accounts_id, accounts) = slot_account_fixture(&[
+        (1, true, "root"),
+        (2, false, ""),
+        (3, false, ""),
+        (4, false, ""),
+    ])
     .await?;
 
     let update_req = slot_update();
@@ -450,7 +890,7 @@ async fn create_account_dell_slot_defined_first_available() -> TestResult<()> {
 
     let account = into_entity(accounts.create_account(create_request("user")).await?).raw();
 
-    assert_eq!(account.base.id, "3");
+    assert_eq!(account.id, "3");
     assert_eq!(account.user_name, Some("user".into()));
     assert_eq!(account.role_id, Some("Operator".into()));
     assert_eq!(account.enabled, Some(true));
@@ -459,9 +899,67 @@ async fn create_account_dell_slot_defined_first_available() -> TestResult<()> {
 }
 
 #[test]
+async fn create_account_slot_defined_preserves_nested_writable_values() -> TestResult<()> {
+    let (bmc, accounts_id, accounts) = slot_account_fixture(&[(3, false, "")]).await?;
+    let account_id = format!("{accounts_id}/3");
+    bmc.expect(Expect::get(
+        &account_id,
+        slot_member(&accounts_id, 3, false, "", Some("slot-3-v1")),
+    ));
+    bmc.expect(Expect::update_empty(
+        &account_id,
+        json!({
+            "UserName": "user",
+            "Password": "password",
+            "RoleId": "Operator",
+            "Enabled": true,
+            "SNMP": { "AuthenticationKey": "auth-key", "EncryptionKey": "encryption-key" },
+            "MFABypass": { "BypassTypes": [] },
+        }),
+    ));
+    let create = create_request("user")
+        .with_snmp(
+            SnmpUserInfoCreate::builder()
+                .with_authentication_key("auth-key".into())
+                .with_encryption_key("encryption-key".into())
+                .with_authentication_key_set(true)
+                .build(),
+        )
+        .with_mfa_bypass(MfaBypassCreate::builder().with_bypass_types(vec![]).build());
+    assert_empty(accounts.create_account(create).await?);
+
+    Ok(())
+}
+
+#[test]
+async fn create_account_slot_defined_uses_lowest_in_range() -> TestResult<()> {
+    let (bmc, accounts_id, accounts) =
+        slot_account_fixture(&[(17, false, ""), (4, false, ""), (3, false, "")]).await?;
+    let account_id = format!("{accounts_id}/3");
+
+    bmc.expect(Expect::get(
+        &account_id,
+        slot_member(&accounts_id, 3, false, "", Some("slot-3-current")),
+    ));
+    bmc.expect(Expect::update(
+        &account_id,
+        serde_json::to_value(slot_update())?,
+        json_merge([
+            &slot_member(&accounts_id, 3, true, "user", None),
+            &json!({ "RoleId": "Operator" }),
+        ]),
+    ));
+
+    let account = into_entity(accounts.create_account(create_request("user")).await?);
+    assert_eq!(account.raw().id, "3");
+
+    Ok(())
+}
+
+#[test]
 async fn create_account_slot_defined_rechecks_stale_candidate() -> TestResult<()> {
     let (bmc, accounts_id, accounts) =
-        account_fixture("Dell", &[(3, false, ""), (4, false, "")]).await?;
+        slot_account_fixture(&[(3, false, ""), (4, false, "")]).await?;
     let update_req = slot_update();
     let update_json = serde_json::to_value(&update_req).unwrap();
     let stale_account_id = format!("{accounts_id}/3");
@@ -487,15 +985,110 @@ async fn create_account_slot_defined_rechecks_stale_candidate() -> TestResult<()
 
     let account = into_entity(accounts.create_account(create_request("user")).await?).raw();
 
-    assert_eq!(account.base.id, "4");
+    assert_eq!(account.id, "4");
     assert_eq!(account.user_name.as_deref(), Some("user"));
 
     Ok(())
 }
 
 #[test]
+async fn create_account_slot_defined_skips_response_parse_errors() -> TestResult<()> {
+    let bmc = Arc::new(Bmc::default());
+    let root_id = ODataId::service_root();
+
+    let account_service = get_account_service_with_config(
+        bmc.clone(),
+        &root_id,
+        "Dell",
+        IdracVersion::IDRAC9.account_service_config(),
+    )
+    .await?;
+
+    let accounts_id = format!("{}/Accounts", account_service.raw().odata_id());
+    let unreadable_member_id = format!("{accounts_id}/3");
+    let unreadable_candidate_id = format!("{accounts_id}/4");
+    let available_account_id = format!("{accounts_id}/5");
+
+    let accounts = get_account_collection(
+        bmc.clone(),
+        &account_service,
+        json!([
+            { ODATA_ID: &unreadable_member_id },
+            slot_member(&accounts_id, 4, false, "", None),
+            slot_member(&accounts_id, 5, false, "", None),
+        ]),
+    )
+    .await?;
+
+    bmc.expect(Expect::get(
+        &unreadable_member_id,
+        json!({ "malformed": true }),
+    ));
+
+    bmc.expect(Expect::get(
+        &unreadable_candidate_id,
+        json!({ "malformed": true }),
+    ));
+
+    bmc.expect(Expect::get(
+        &available_account_id,
+        slot_member(&accounts_id, 5, false, "", Some("slot-5-current")),
+    ));
+
+    bmc.expect(Expect::update(
+        &available_account_id,
+        serde_json::to_value(slot_update())?,
+        json_merge([
+            &slot_member(&accounts_id, 5, true, "user", None),
+            &json!({ "RoleId": "Operator" }),
+        ]),
+    ));
+
+    let account = into_entity(accounts.create_account(create_request("user")).await?);
+
+    assert_eq!(account.raw().id, "5");
+
+    Ok(())
+}
+
+#[test]
+async fn create_account_slot_defined_skips_unclassified_refetch_errors() -> TestResult<()> {
+    let (bmc, accounts_id, accounts) =
+        slot_account_fixture(&[(3, false, ""), (4, false, "")]).await?;
+
+    let available_account_id = format!("{accounts_id}/4");
+
+    // The first expectation intentionally mismatches slot 3, producing an
+    // unclassified backend error before slot 4 is retried successfully.
+    bmc.expect(Expect::get(
+        &available_account_id,
+        slot_member(&accounts_id, 4, false, "", Some("slot-4-current")),
+    ));
+
+    bmc.expect(Expect::get(
+        &available_account_id,
+        slot_member(&accounts_id, 4, false, "", Some("slot-4-current")),
+    ));
+
+    bmc.expect(Expect::update(
+        &available_account_id,
+        serde_json::to_value(slot_update())?,
+        json_merge([
+            &slot_member(&accounts_id, 4, true, "user", None),
+            &json!({ "RoleId": "Operator" }),
+        ]),
+    ));
+
+    let account = into_entity(accounts.create_account(create_request("user")).await?);
+
+    assert_eq!(account.raw().id, "4");
+
+    Ok(())
+}
+
+#[test]
 async fn create_account_slot_defined_requires_etag() -> TestResult<()> {
-    let (bmc, accounts_id, accounts) = account_fixture("Dell", &[(3, false, "")]).await?;
+    let (bmc, accounts_id, accounts) = slot_account_fixture(&[(3, false, "")]).await?;
     let account_id = format!("{accounts_id}/3");
 
     bmc.expect(Expect::get(
@@ -514,7 +1107,7 @@ async fn create_account_slot_defined_requires_etag() -> TestResult<()> {
 #[test]
 async fn create_account_slot_defined_preserves_async_task() -> TestResult<()> {
     let (bmc, accounts_id, accounts) =
-        account_fixture("Dell", &[(1, true, "root"), (3, false, "")]).await?;
+        slot_account_fixture(&[(1, true, "root"), (3, false, "")]).await?;
 
     let update_req = slot_update();
     let update_json = serde_json::to_value(&update_req).unwrap();
@@ -537,6 +1130,25 @@ async fn create_account_slot_defined_preserves_async_task() -> TestResult<()> {
         task_id,
         8,
     );
+
+    Ok(())
+}
+
+#[test]
+async fn create_account_slot_defined_preserves_empty_response() -> TestResult<()> {
+    let (bmc, accounts_id, accounts) = slot_account_fixture(&[(3, false, "")]).await?;
+    let account_id = format!("{accounts_id}/3");
+
+    bmc.expect(Expect::get(
+        &account_id,
+        slot_member(&accounts_id, 3, false, "", Some("slot-3-current")),
+    ));
+    bmc.expect(Expect::update_empty(
+        &account_id,
+        serde_json::to_value(slot_update())?,
+    ));
+
+    assert_empty(accounts.create_account(create_request("user")).await?);
 
     Ok(())
 }
@@ -611,18 +1223,66 @@ async fn delete_account_preserves_task_and_empty_responses() -> TestResult<()> {
     Ok(())
 }
 
-// Create account (Dell slot-defined): error when no disabled slot id >= min_slot is available.
+#[test]
+async fn delete_preallocated_slot_disables_account() -> TestResult<()> {
+    let (bmc, accounts_id, accounts) = slot_account_fixture(&[(3, true, "user")]).await?;
+    let account = accounts
+        .all_accounts_data()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("missing account")?;
+    let account_id = format!("{accounts_id}/3");
+    let disable = ManagerAccountUpdate::builder().with_enabled(false).build();
+
+    bmc.expect(Expect::update(
+        &account_id,
+        serde_json::to_value(&disable)?,
+        slot_member(&accounts_id, 3, false, "user", None),
+    ));
+
+    let deleted = into_entity(account.delete().await?);
+    assert!(!deleted.is_enabled());
+
+    Ok(())
+}
+
+#[test]
+async fn delete_preallocated_slot_preserves_task_and_empty_responses() -> TestResult<()> {
+    let (bmc, accounts_id, accounts) =
+        slot_account_fixture(&[(3, true, "first"), (4, true, "second")]).await?;
+    let mut account_data = accounts.all_accounts_data().await?.into_iter();
+    let task_account = account_data.next().ok_or("missing first account")?;
+    let empty_account = account_data.next().ok_or("missing second account")?;
+    let disable = ManagerAccountUpdate::builder().with_enabled(false).build();
+    let disable_json = serde_json::to_value(&disable)?;
+    let task_id = "/redfish/v1/TaskService/Tasks/46";
+
+    bmc.expect(Expect::update_task(
+        format!("{accounts_id}/3"),
+        &disable_json,
+        async_task(task_id, 11),
+    ));
+    assert_task(task_account.delete().await?, task_id, 11);
+
+    bmc.expect(Expect::update_empty(
+        format!("{accounts_id}/4"),
+        &disable_json,
+    ));
+    assert_empty(empty_account.delete().await?);
+
+    Ok(())
+}
+
+// Create account in fixed slots: error when no disabled slot in 3..=16 is available.
 #[test]
 async fn create_account_dell_slot_defined_no_slot_available() -> TestResult<()> {
-    let (_, _, accounts) = account_fixture(
-        "Dell",
-        &[
-            (1, false, ""),
-            (2, false, ""),
-            (3, true, "root"),
-            (4, true, "other"),
-        ],
-    )
+    let (_, _, accounts) = slot_account_fixture(&[
+        (1, false, ""),
+        (2, false, ""),
+        (3, true, "root"),
+        (4, true, "other"),
+    ])
     .await?;
 
     assert!(accounts
@@ -633,19 +1293,16 @@ async fn create_account_dell_slot_defined_no_slot_available() -> TestResult<()> 
     Ok(())
 }
 
-// List accounts (Dell slot-defined): disabled accounts are hidden.
+// List accounts in fixed slots: disabled accounts are hidden.
 #[test]
 async fn list_dell_accounts_hide_disabled() -> TestResult<()> {
-    let (_, _, accounts) = account_fixture(
-        "Dell",
-        &[(1, true, "root"), (3, false, ""), (4, true, "other")],
-    )
-    .await?;
+    let (_, _, accounts) =
+        slot_account_fixture(&[(1, true, "root"), (3, false, ""), (4, true, "other")]).await?;
 
     let data = accounts.all_accounts_data().await?;
     let ids: Vec<_> = data
         .into_iter()
-        .map(|a| a.raw().as_ref().base.id.clone())
+        .map(|a| a.raw().as_ref().id.clone())
         .collect();
 
     assert_eq!(ids, vec!["1", "4"]);

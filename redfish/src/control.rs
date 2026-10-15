@@ -45,8 +45,6 @@ use crate::schema::control::Control as ControlSchema;
 use crate::schema::control_collection::ControlCollection as ControlCollectionSchema;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
 
 use nv_redfish_core::Bmc;
 use nv_redfish_core::EntityTypeRef as _;
@@ -177,17 +175,9 @@ impl<B: Bmc> Control<B> {
         update: &ControlUpdate,
     ) -> Result<ModificationResponse<Self>, Error<B>> {
         self.bmc
-            .as_ref()
             .update::<_, NavProperty<ControlSchema>>(self.data.odata_id(), self.data.etag(), update)
-            .await
-            .map_err(Error::Bmc)?
+            .await?
             .try_map_entity_async(|nav| async move { Self::new(&self.bmc, &nav).await })
             .await
-    }
-}
-
-impl<B: Bmc> Resource for Control<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
     }
 }

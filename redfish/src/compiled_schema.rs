@@ -33,3 +33,69 @@
 pub mod redfish {
     include!(concat!(env!("OUT_DIR"), "/redfish.rs"));
 }
+
+#[cfg(all(test, feature = "resource-serialization"))]
+mod tests {
+    use super::redfish::resource::ItemOrCollection;
+    use super::redfish::service_root::ServiceRoot;
+    use super::redfish::SettingsAnnotations;
+    use serde_json::json;
+
+    #[test]
+    fn inherited_read_fields_preserve_resource_json() {
+        let value = json!({
+            "@odata.id": "/redfish/v1",
+            "@odata.etag": "revision-1",
+            "Id": "RootService",
+            "Name": "Root Service",
+            "Description": null,
+            "RedfishVersion": "1.18.0",
+            "Links": {
+                "Sessions": { "@odata.id": "/redfish/v1/SessionService/Sessions" }
+            },
+            "Oem": { "Vendor": { "Custom": 42 } },
+        });
+        let resource: ServiceRoot =
+            serde_json::from_value(value.clone()).expect("inherited fields deserialize");
+        assert_eq!(
+            serde_json::to_value(resource).expect("resource serializes"),
+            value
+        );
+
+        let mut missing_name = value;
+        missing_name
+            .as_object_mut()
+            .expect("resource object")
+            .remove("Name");
+        assert!(serde_json::from_value::<ServiceRoot>(missing_name).is_err());
+    }
+
+    #[test]
+    fn settings_annotations_preserve_resource_json() {
+        assert_eq!(
+            serde_json::to_value(SettingsAnnotations::default())
+                .expect("empty annotations serialize"),
+            json!({}),
+        );
+        for value in [
+            json!({ "@odata.id": "/redfish/v1/Systems/1/Bios" }),
+            json!({
+                "@odata.id": "/redfish/v1/Systems/1/Bios",
+                "@Redfish.Settings": {
+                    "SettingsObject": { "@odata.id": "/redfish/v1/Systems/1/Bios/Settings" }
+                },
+                "@Redfish.SettingsApplyTime": {
+                    "ApplyTime": "OnReset",
+                    "MaintenanceWindowDurationInSeconds": 60
+                }
+            }),
+        ] {
+            let resource: ItemOrCollection = serde_json::from_value(value.clone())
+                .expect("resource with settings annotations deserializes");
+            assert_eq!(
+                serde_json::to_value(resource).expect("resource serializes"),
+                value,
+            );
+        }
+    }
+}

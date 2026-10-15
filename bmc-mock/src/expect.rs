@@ -16,12 +16,15 @@
 //! Expectations for Bmc Mock.
 
 use std::fmt::Display;
+use std::time::Duration;
 
 use nv_redfish_core::action::ActionTarget;
 use nv_redfish_core::AsyncTask;
+use nv_redfish_core::ODataETag;
 use nv_redfish_core::ODataId;
 
 use serde_json::from_str;
+use serde_json::json;
 use serde_json::Value as JsonValue;
 
 pub type Response<E> = Result<JsonValue, E>;
@@ -32,11 +35,37 @@ pub enum ExpectedRequest {
     /// Expected Get.
     Get { id: ODataId },
 
+    /// Expected poll response carrying a body.
+    PollResult { id: ODataId },
+
+    /// Expected pending poll response.
+    PollPending {
+        id: ODataId,
+        location: Option<ODataId>,
+        retry_after: Option<Duration>,
+    },
+
+    /// Expected poll response with no body.
+    PollEmpty { id: ODataId },
+
+    /// Expected poll response failing with an HTTP status.
+    PollStatus { id: ODataId, status: u16 },
+
+    /// Expected poll response that never completes.
+    PollWait { id: ODataId },
+
     /// Expected Expand.
     Expand { id: ODataId },
 
     /// Expected Update.
     Update { id: ODataId, request: JsonValue },
+
+    /// Expected Update sent with a specific `If-Match` ETag (`None` for `*`).
+    UpdateWithEtag {
+        id: ODataId,
+        etag: Option<ODataETag>,
+        request: JsonValue,
+    },
 
     /// Expected asynchronous update.
     UpdateTask {
@@ -75,6 +104,19 @@ pub enum ExpectedRequest {
         request: JsonValue,
     },
 
+    /// Expected asynchronous ActionTarget.
+    ActionTask {
+        target: ActionTarget,
+        request: JsonValue,
+        task: AsyncTask,
+    },
+
+    /// Expected ActionTarget with no response body.
+    ActionEmpty {
+        target: ActionTarget,
+        request: JsonValue,
+    },
+
     /// Expected multipart update.
     MultipartUpdate {
         uri: String,
@@ -95,6 +137,13 @@ pub enum ExpectedRequest {
 
     /// Expected Stream.
     Stream { uri: String },
+
+    /// Expected stream opened with this `Last-Event-ID`, answered with
+    /// events that carry ids.
+    StreamEvents {
+        uri: String,
+        last_event_id: Option<String>,
+    },
 }
 
 /// Expectation for the tests.
@@ -113,6 +162,61 @@ impl<E> Expect<E> {
             response: Ok(from_str(&response.to_string()).expect("invalid json")),
         }
     }
+
+    pub fn poll_result(uri: impl Display, response: impl Display) -> Self {
+        Expect {
+            request: ExpectedRequest::PollResult {
+                id: uri.to_string().into(),
+            },
+            response: Ok(from_str(&response.to_string()).expect("invalid json")),
+        }
+    }
+
+    /// Expect a pending poll response. A `None` location keeps polling
+    /// `uri`, as the HTTP transport does when `Location` is omitted.
+    pub fn poll_pending(
+        uri: impl Display,
+        location: Option<&str>,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        Expect {
+            request: ExpectedRequest::PollPending {
+                id: uri.to_string().into(),
+                location: location.map(|value| ODataId::from(value.to_string())),
+                retry_after,
+            },
+            response: Ok(JsonValue::Null),
+        }
+    }
+
+    pub fn poll_empty(uri: impl Display) -> Self {
+        Expect {
+            request: ExpectedRequest::PollEmpty {
+                id: uri.to_string().into(),
+            },
+            response: Ok(JsonValue::Null),
+        }
+    }
+
+    pub fn poll_status(uri: impl Display, status: u16) -> Self {
+        Expect {
+            request: ExpectedRequest::PollStatus {
+                id: uri.to_string().into(),
+                status,
+            },
+            response: Ok(JsonValue::Null),
+        }
+    }
+
+    pub fn poll_wait(uri: impl Display) -> Self {
+        Expect {
+            request: ExpectedRequest::PollWait {
+                id: uri.to_string().into(),
+            },
+            response: Ok(JsonValue::Null),
+        }
+    }
+
     pub fn expand(uri: impl Display, response: impl Display) -> Self {
         Expect {
             request: ExpectedRequest::Expand {
@@ -125,6 +229,22 @@ impl<E> Expect<E> {
         Expect {
             request: ExpectedRequest::Update {
                 id: uri.to_string().into(),
+                request: from_str(&request.to_string()).expect("invalid json"),
+            },
+            response: Ok(from_str(&response.to_string()).expect("invalid json")),
+        }
+    }
+
+    pub fn update_with_etag(
+        uri: impl Display,
+        etag: Option<&str>,
+        request: impl Display,
+        response: impl Display,
+    ) -> Self {
+        Expect {
+            request: ExpectedRequest::UpdateWithEtag {
+                id: uri.to_string().into(),
+                etag: etag.map(|etag| ODataETag::from(etag.to_string())),
                 request: from_str(&request.to_string()).expect("invalid json"),
             },
             response: Ok(from_str(&response.to_string()).expect("invalid json")),
@@ -210,6 +330,29 @@ impl<E> Expect<E> {
         }
     }
 
+    /// Expect an action that returns an asynchronous task.
+    pub fn action_task(uri: impl Display, request: impl Display, task: AsyncTask) -> Self {
+        Expect {
+            request: ExpectedRequest::ActionTask {
+                target: ActionTarget::new(uri.to_string()),
+                request: from_str(&request.to_string()).expect("invalid json"),
+                task,
+            },
+            response: Ok(JsonValue::Null),
+        }
+    }
+
+    /// Expect an action that returns no response body.
+    pub fn action_empty(uri: impl Display, request: impl Display) -> Self {
+        Expect {
+            request: ExpectedRequest::ActionEmpty {
+                target: ActionTarget::new(uri.to_string()),
+                request: from_str(&request.to_string()).expect("invalid json"),
+            },
+            response: Ok(JsonValue::Null),
+        }
+    }
+
     pub fn multipart_update(
         uri: impl Display,
         request: impl Display,
@@ -278,12 +421,36 @@ impl<E> Expect<E> {
         }
     }
 
+    /// A stream of `response`, a JSON array of payloads. It serves `stream`,
+    /// and `stream_events` opened without a `Last-Event-ID`, whose events
+    /// then carry no id.
     pub fn stream(uri: impl Display, response: impl Display) -> Self {
         Expect {
             request: ExpectedRequest::Stream {
                 uri: uri.to_string(),
             },
             response: Ok(from_str(&response.to_string()).expect("invalid json")),
+        }
+    }
+
+    /// A stream opened with `last_event_id`, delivering `events` as pairs of
+    /// the id the client sees on the event and the payload. It serves
+    /// `stream_events` asked for that id, and `stream` when the id is `None`.
+    pub fn stream_events<'a>(
+        uri: impl Display,
+        last_event_id: Option<&str>,
+        events: impl IntoIterator<Item = (Option<&'a str>, JsonValue)>,
+    ) -> Self {
+        let events = events
+            .into_iter()
+            .map(|(id, data)| json!({ "last_event_id": id, "data": data }))
+            .collect();
+        Expect {
+            request: ExpectedRequest::StreamEvents {
+                uri: uri.to_string(),
+                last_event_id: last_event_id.map(str::to_owned),
+            },
+            response: Ok(JsonValue::Array(events)),
         }
     }
 }

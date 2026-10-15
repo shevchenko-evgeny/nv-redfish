@@ -131,6 +131,18 @@ mod tests {
             }
         }
 
+        fn poll<T>(
+            &self,
+            url: Url,
+            _credentials: &BmcCredentials,
+            _custom_headers: &HeaderMap,
+        ) -> impl Future<Output = Result<ModificationResponse<T>, Self::Error>> + Send
+        where
+            T: DeserializeOwned + Send + Sync,
+        {
+            self.modification_response(url.path().to_owned())
+        }
+
         fn post<B, T>(
             &self,
             url: Url,
@@ -712,6 +724,36 @@ mod tests {
         let next_id = ODataId::from("/next".to_owned());
 
         let mut sse = tokio_test::task::spawn(bmc.stream::<JsonValue>(SSE_URI));
+
+        assert!(matches!(sse.poll(), Poll::Pending));
+        let sse_attempt = transport.next_attempt();
+
+        assert_eq!(sse_attempt.path, SSE_URI);
+
+        let mut next = tokio_test::task::spawn(bmc.get::<TestResource>(&next_id));
+        assert_pending!(next.poll());
+        transport.assert_no_attempt();
+
+        respond(sse_attempt, TestResponse::SseEstablished);
+
+        let _stream = assert_ready_ok!(sse.poll());
+
+        assert!(next.is_woken());
+        assert_pending!(next.poll());
+        let next_attempt = transport.next_attempt();
+
+        assert_eq!(next_attempt.path, "/next");
+        respond(next_attempt, TestResponse::Resource(None));
+        assert_ready_ok!(next.poll());
+    }
+
+    #[test]
+    fn stream_events_holds_the_permit_during_establishment_like_stream() {
+        let (client, mut transport) = controlled_client();
+        let bmc = create_bmc(client, NonZeroUsize::MIN, 0);
+        let next_id = ODataId::from("/next".to_owned());
+
+        let mut sse = tokio_test::task::spawn(bmc.stream_events::<JsonValue>(SSE_URI, None));
 
         assert!(matches!(sse.poll(), Poll::Pending));
         let sse_attempt = transport.next_attempt();

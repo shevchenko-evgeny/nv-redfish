@@ -22,14 +22,16 @@ use crate::schema::boot_option_collection::BootOptionCollection as BootOptionCol
 use crate::schema::resource::ResourceCollection;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
 use nv_redfish_core::Bmc;
+use nv_redfish_core::EntityTypeRef as _;
+use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::NavProperty;
+use nv_redfish_core::RedfishSettings as _;
 use std::convert::identity;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use tagged_types::TaggedType;
+
+pub use crate::schema::boot_option::BootOptionUpdate;
 
 /// Boot options collection.
 ///
@@ -46,7 +48,16 @@ impl<B: Bmc> CollectionWithPatch<BootOptionCollectionSchema, BootOptionSchema, B
         base: ResourceCollection,
         members: Vec<NavProperty<BootOptionSchema>>,
     ) -> BootOptionCollectionSchema {
-        BootOptionCollectionSchema { base, members }
+        BootOptionCollectionSchema {
+            odata_id: base.odata_id,
+            odata_etag: base.odata_etag,
+            odata_type: base.odata_type,
+            settings_annotations: base.settings_annotations,
+            description: base.description,
+            name: base.name,
+            oem: base.oem,
+            members,
+        }
     }
 }
 
@@ -103,8 +114,8 @@ pub enum DisplayNameTag {}
 ///
 /// Provides functions to access boot option.
 pub struct BootOption<B: Bmc> {
+    bmc: NvBmc<B>,
     data: Arc<BootOptionSchema>,
-    _marker: PhantomData<B>,
 }
 
 impl<B: Bmc> BootOption<B> {
@@ -117,8 +128,8 @@ impl<B: Bmc> BootOption<B> {
             .await
             .map_err(crate::Error::Bmc)
             .map(|data| Self {
+                bmc: bmc.clone(),
                 data,
-                _marker: PhantomData,
             })
     }
 
@@ -128,12 +139,50 @@ impl<B: Bmc> BootOption<B> {
         self.data.clone()
     }
 
+    /// Get the advertised boot option settings object.
+    ///
+    /// Returns `Ok(None)` when this boot option does not advertise
+    /// `@Redfish.Settings`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching the settings object fails.
+    pub async fn settings(&self) -> Result<Option<Self>, Error<B>> {
+        match self.data.settings_object() {
+            Some(settings) => Self::new(&self.bmc, &settings).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Update this boot option.
+    ///
+    /// Call this method on the handle returned by [`Self::settings`] when the
+    /// service advertises `@Redfish.Settings`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating the boot option fails.
+    pub async fn update(
+        &self,
+        update: &BootOptionUpdate,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        self.bmc
+            .update::<_, NavProperty<BootOptionSchema>>(
+                self.data.odata_id(),
+                self.data.etag(),
+                update,
+            )
+            .await?
+            .try_map_entity_async(|nav| async move { Self::new(&self.bmc, &nav).await })
+            .await
+    }
+
     ///
     /// Boot option reference.
     #[must_use]
     pub fn boot_reference(&self) -> BootOptionReference<&str> {
         self.data.boot_option_reference.as_deref().map_or_else(
-            || BootOptionReference::new(self.id().inner()),
+            || BootOptionReference::new(&self.data.id),
             BootOptionReference::new,
         )
     }
@@ -165,11 +214,5 @@ impl<B: Bmc> BootOption<B> {
             .and_then(Option::as_ref)
             .map(String::as_str)
             .map(UefiDevicePath::new)
-    }
-}
-
-impl<B: Bmc> Resource for BootOption<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
     }
 }

@@ -24,19 +24,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::NavProperty;
+#[cfg(feature = "oem-nvidia")]
+use crate::oem::nvidia::NvidiaUpdateServiceActions;
 use crate::patch_support::Payload;
 use crate::patch_support::ReadPatchFn;
 use crate::schema::update_service::UpdateService as UpdateServiceSchema;
 use crate::schema::update_service::UpdateServiceSimpleUpdateAction;
+use crate::schema::ActionAnnotations;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
 use crate::ServiceRoot;
 
 use nv_redfish_core::Bmc;
 use nv_redfish_core::DataStream;
-#[cfg(feature = "update-service-deprecated")]
 use nv_redfish_core::EntityTypeRef as _;
 #[cfg(feature = "update-service-deprecated")]
 use nv_redfish_core::HttpPushUriUpdateRequest;
@@ -49,10 +49,11 @@ use serde_json::Value as JsonValue;
 use software_inventory::SoftwareInventoryCollection;
 
 #[doc(inline)]
+pub use crate::schema::settings::OperationApplyTime;
+#[doc(inline)]
 pub use crate::schema::update_service::TransferProtocolType;
 #[doc(inline)]
 pub use crate::schema::update_service::UpdateParametersUpdate as MultipartUpdateParameters;
-#[cfg(feature = "update-service-deprecated")]
 #[doc(inline)]
 pub use crate::schema::update_service::UpdateServiceUpdate;
 #[doc(inline)]
@@ -61,6 +62,23 @@ pub use software_inventory::SoftwareInventory;
 pub use software_inventory::Version;
 #[doc(inline)]
 pub use software_inventory::VersionRef;
+
+/// Multipart update parameters with `@Redfish.OperationApplyTime`.
+///
+/// The Redfish specification allows the annotation in multipart update
+/// parameters, but the schema type can't carry it.
+#[derive(serde::Serialize, Debug, Default)]
+pub struct MultipartUpdateParametersWithApplyTime {
+    /// Update parameters.
+    #[serde(flatten)]
+    pub parameters: MultipartUpdateParameters,
+    /// When the service applies the update.
+    #[serde(
+        rename = "@Redfish.OperationApplyTime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub operation_apply_time: Option<OperationApplyTime>,
+}
 
 /// Update service.
 ///
@@ -102,7 +120,7 @@ impl<B: Bmc> UpdateService<B> {
             .map(Some)
         } else if bmc.quirks.bug_missing_root_nav_properties() {
             let nav =
-                NavProperty::new_reference(format!("{}/UpdateService", root.odata_id()).into());
+                NavProperty::new_reference(format!("{}/UpdateService", root.root.odata_id).into());
             if let Some(service_patch_fn) = service_patch_fn {
                 Payload::get(bmc.as_ref(), &nav, service_patch_fn.as_ref()).await
             } else {
@@ -128,6 +146,23 @@ impl<B: Bmc> UpdateService<B> {
     #[must_use]
     pub fn raw(&self) -> Arc<UpdateServiceSchema> {
         self.data.clone()
+    }
+
+    /// Get the NVIDIA OEM actions advertised by this update service.
+    ///
+    /// Returns `Ok(None)` when the service has no OEM actions object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if NVIDIA OEM actions cannot be parsed.
+    #[cfg(feature = "oem-nvidia")]
+    pub fn oem_nvidia_actions(&self) -> Result<Option<NvidiaUpdateServiceActions<B>>, Error<B>> {
+        self.data
+            .actions
+            .as_ref()
+            .and_then(|actions| actions.oem.as_ref())
+            .map(|actions| NvidiaUpdateServiceActions::new(&self.bmc, actions))
+            .transpose()
     }
 
     /// List all firmware inventory items.
@@ -227,6 +262,7 @@ impl<B: Bmc> UpdateService<B> {
             .simple_update(
                 self.bmc.as_ref(),
                 &UpdateServiceSimpleUpdateAction {
+                    redfish_annotations: ActionAnnotations::default(),
                     image_uri,
                     transfer_protocol,
                     targets,
@@ -266,28 +302,24 @@ impl<B: Bmc> UpdateService<B> {
             .map_err(Error::Bmc)
     }
 
-    /// Update this service with deprecated generated `UpdateServiceUpdate` fields.
+    /// Update this service with generated `UpdateServiceUpdate` fields.
     ///
-    /// Use this for standard `HttpPushUriOptions`, `HttpPushUriTargets`, and
-    /// related busy flags before or after an `HttpPushUri` upload.
+    /// This also supports composing OEM fields into the standard update.
     ///
     /// # Errors
     ///
     /// Returns an error if the update request fails.
-    #[cfg(feature = "update-service-deprecated")]
     pub async fn update(
         &self,
         update: &UpdateServiceUpdate,
     ) -> Result<ModificationResponse<Self>, Error<B>> {
         self.bmc
-            .as_ref()
             .update::<_, NavProperty<UpdateServiceSchema>>(
                 self.data.odata_id(),
                 self.data.etag(),
                 update,
             )
-            .await
-            .map_err(Error::Bmc)?
+            .await?
             .try_map_entity_async(|nav| async move {
                 let data = nav.get(self.bmc.as_ref()).await.map_err(Error::Bmc)?;
 
@@ -407,12 +439,6 @@ impl<B: Bmc> UpdateService<B> {
             .multipart_update(multipart_uri, request)
             .await
             .map_err(Error::Bmc)
-    }
-}
-
-impl<B: Bmc> Resource for UpdateService<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
     }
 }
 

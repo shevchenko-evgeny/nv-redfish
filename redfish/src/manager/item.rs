@@ -15,14 +15,16 @@
 
 use crate::resource::ResetType;
 use crate::schema::manager::Manager as ManagerSchema;
+use crate::schema::manager::ManagerUpdate;
 use crate::schema::manager::ResetToDefaultsType as ManagerResetToDefaultsType;
 use crate::Error;
 use crate::NvBmc;
-use crate::Resource;
-use crate::ResourceSchema;
+use nv_redfish_core::action::Action;
 use nv_redfish_core::Bmc;
+use nv_redfish_core::EntityTypeRef as _;
 use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::NavProperty;
+use serde_json::json;
 use std::sync::Arc;
 
 #[cfg(feature = "manager-network-protocol")]
@@ -37,12 +39,18 @@ use crate::log_service::LogService;
 use crate::oem::ami::config_bmc::ConfigBmc as AmiConfigBmc;
 #[cfg(feature = "oem-dell-attributes")]
 use crate::oem::dell::attributes::DellAttributes;
+#[cfg(feature = "oem-dell")]
+use crate::oem::dell::DellManager;
 #[cfg(feature = "oem-hpe")]
 use crate::oem::hpe::manager::HpeManager;
 #[cfg(feature = "oem-lenovo")]
 use crate::oem::lenovo::manager::LenovoManager;
+#[cfg(feature = "oem-nvidia")]
+use crate::oem::nvidia::manager::NvidiaManager;
 #[cfg(feature = "oem-supermicro")]
 use crate::oem::supermicro::manager::SupermicroManager;
+#[cfg(feature = "serial-interfaces")]
+use crate::serial_interface::SerialInterfaceCollection;
 
 /// Represents a manager (BMC) in the system.
 ///
@@ -75,6 +83,22 @@ impl<B: Bmc> Manager<B> {
     #[must_use]
     pub fn raw(&self) -> Arc<ManagerSchema> {
         self.data.clone()
+    }
+
+    /// Update this manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating or fetching the returned entity fails.
+    pub async fn update(
+        &self,
+        update: &ManagerUpdate,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        self.bmc
+            .update::<_, NavProperty<ManagerSchema>>(self.data.odata_id(), self.data.etag(), update)
+            .await?
+            .try_map_entity_async(|nav| async move { Self::new(&self.bmc, &nav).await })
+            .await
     }
 
     /// Get the network protocol resource associated with this manager.
@@ -126,6 +150,9 @@ impl<B: Bmc> Manager<B> {
 
     /// Reset this manager's settings to defaults.
     ///
+    /// On Lite-On power shelves the reset type is sent as
+    /// `ResetToDefaultsType`, the only parameter name they accept.
+    ///
     /// # Errors
     ///
     /// Returns an error if the manager does not support the `ResetToDefaults`
@@ -142,9 +169,26 @@ impl<B: Bmc> Manager<B> {
             .actions
             .as_ref()
             .ok_or(Error::ActionNotAvailable)?;
+        let action = actions
+            .reset_to_defaults
+            .as_ref()
+            .ok_or(Error::ActionNotAvailable)?;
 
-        if actions.reset_to_defaults.is_none() {
-            return Err(Error::ActionNotAvailable);
+        let manufacturer = self.data.manufacturer.as_ref().and_then(Option::as_deref);
+        if self
+            .bmc
+            .quirks
+            .bug_reset_to_defaults_type_parameter(manufacturer)
+        {
+            return self
+                .bmc
+                .as_ref()
+                .action::<_, ()>(
+                    &Action::new(action.target.clone()),
+                    &json!({ "ResetToDefaultsType": reset_type }),
+                )
+                .await
+                .map_err(Error::Bmc);
         }
 
         actions
@@ -191,6 +235,24 @@ impl<B: Bmc> Manager<B> {
         }
     }
 
+    /// Get serial interfaces for this manager.
+    ///
+    /// Returns `Ok(None)` when the serial interfaces link is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching serial interfaces data fails.
+    #[cfg(feature = "serial-interfaces")]
+    pub async fn serial_interfaces(
+        &self,
+    ) -> Result<Option<SerialInterfaceCollection<B>>, Error<B>> {
+        if let Some(p) = &self.data.serial_interfaces {
+            SerialInterfaceCollection::new(&self.bmc, p).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get log services for this manager.
     ///
     /// Returns `Ok(None)` when the log services link is absent.
@@ -226,7 +288,24 @@ impl<B: Bmc> Manager<B> {
     /// Returns an error if fetching manager attributes data fails.
     #[cfg(feature = "oem-dell-attributes")]
     pub async fn oem_dell_attributes(&self) -> Result<Option<DellAttributes<B>>, Error<B>> {
-        DellAttributes::manager_attributes(&self.bmc, &self.data).await
+        if let Some(dell) = self.oem_dell()? {
+            if let Some(attributes) = dell.manager_attributes().await? {
+                return Ok(Some(attributes));
+            }
+        }
+        DellAttributes::new_fallback(&self.bmc, &self.data).await
+    }
+
+    /// Get Dell resources and OEM actions advertised by this Manager.
+    ///
+    /// Returns `Ok(None)` when the Manager advertises neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Dell links or actions cannot be parsed.
+    #[cfg(feature = "oem-dell")]
+    pub fn oem_dell(&self) -> Result<Option<DellManager<B>>, Error<B>> {
+        DellManager::new(&self.bmc, &self.data)
     }
 
     /// Get Lenovo Manager OEM.
@@ -239,6 +318,21 @@ impl<B: Bmc> Manager<B> {
     #[cfg(feature = "oem-lenovo")]
     pub fn oem_lenovo(&self) -> Result<Option<LenovoManager<B>>, Error<B>> {
         LenovoManager::new(&self.bmc, &self.data)
+    }
+
+    /// NVIDIA OEM extension
+    ///
+    /// Returns `Ok(None)` when the manager does not include NVIDIA OEM extension data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if NVIDIA OEM data parsing fails.
+    #[cfg(feature = "oem-nvidia")]
+    pub fn oem_nvidia(&self) -> Result<Option<NvidiaManager<B>>, Error<B>> {
+        self.data
+            .oem
+            .as_ref()
+            .map_or_else(|| Ok(None), |oem| NvidiaManager::new(&self.bmc, oem))
     }
 
     /// Get HPE Manager OEM.
@@ -275,11 +369,5 @@ impl<B: Bmc> Manager<B> {
     #[cfg(feature = "oem-ami")]
     pub async fn oem_ami_config_bmc(&self) -> Result<Option<AmiConfigBmc<B>>, Error<B>> {
         AmiConfigBmc::new(&self.bmc, &self.data).await
-    }
-}
-
-impl<B: Bmc> Resource for Manager<B> {
-    fn resource_ref(&self) -> &ResourceSchema {
-        &self.data.as_ref().base
     }
 }

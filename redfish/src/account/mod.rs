@@ -35,14 +35,21 @@ mod collection;
 mod item;
 
 use crate::patch_support::JsonValue;
+use crate::patch_support::Payload;
 use crate::patch_support::ReadPatchFn;
 use crate::schema::account_service::AccountService as SchemaAccountService;
 use crate::Error;
 use crate::NvBmc;
 use crate::ServiceRoot;
 use nv_redfish_core::Bmc;
+use nv_redfish_core::EntityTypeRef as _;
+use nv_redfish_core::ModificationResponse;
+use nv_redfish_core::NavProperty;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
+#[doc(inline)]
+pub use crate::schema::account_service::AccountServiceUpdate;
 #[doc(inline)]
 pub use crate::schema::manager_account::AccountTypes;
 #[doc(inline)]
@@ -55,13 +62,65 @@ pub use item::Account;
 #[doc(inline)]
 pub use collection::AccountCollection;
 #[doc(inline)]
-pub(crate) use collection::SlotDefinedConfig;
+pub(crate) use collection::FixedSlotConfig;
 #[doc(inline)]
 pub(crate) use item::Config as AccountConfig;
+pub(crate) use item::DeletionStrategy;
+
+/// Immutable account behavior selected when loading [`AccountService`].
+#[derive(Clone)]
+pub struct AccountServiceConfig {
+    behavior: AccountServiceBehavior,
+}
+
+#[derive(Clone)]
+enum AccountServiceBehavior {
+    Standard,
+    FixedSlots(RangeInclusive<u32>),
+}
+
+impl AccountServiceConfig {
+    /// Use standard Redfish collection `POST` and resource `DELETE` semantics.
+    #[must_use]
+    pub const fn standard() -> Self {
+        Self {
+            behavior: AccountServiceBehavior::Standard,
+        }
+    }
+
+    #[allow(dead_code)] // Constructed by OEM behavior mappings when enabled.
+    pub(crate) const fn fixed_slots(slots: RangeInclusive<u32>) -> Self {
+        Self {
+            behavior: AccountServiceBehavior::FixedSlots(slots),
+        }
+    }
+
+    fn collection_config(&self, read_patch_fn: Option<ReadPatchFn>) -> collection::Config {
+        match &self.behavior {
+            AccountServiceBehavior::Standard => collection::Config {
+                account: AccountConfig {
+                    read_patch_fn,
+                    deletion_strategy: DeletionStrategy::DeleteResource,
+                },
+                fixed_slots: None,
+            },
+            AccountServiceBehavior::FixedSlots(slots) => collection::Config {
+                account: AccountConfig {
+                    read_patch_fn,
+                    deletion_strategy: DeletionStrategy::DisableSlot,
+                },
+                fixed_slots: Some(FixedSlotConfig {
+                    slots: slots.clone(),
+                }),
+            },
+        }
+    }
+}
 
 /// Account service. Provides the ability to manage accounts via Redfish.
 pub struct AccountService<B: Bmc> {
-    collection_config: collection::Config,
+    config: AccountServiceConfig,
+    account_read_patch_fn: Option<ReadPatchFn>,
     service: Arc<SchemaAccountService>,
     bmc: NvBmc<B>,
 }
@@ -72,11 +131,12 @@ impl<B: Bmc> AccountService<B> {
     pub(crate) async fn new(
         bmc: &NvBmc<B>,
         root: &ServiceRoot<B>,
+        config: AccountServiceConfig,
     ) -> Result<Option<Self>, Error<B>> {
         let Some(service_nav) = root.root.account_service.as_ref() else {
             return Ok(None);
         };
-        let service = service_nav.get(bmc.as_ref()).await.map_err(Error::Bmc)?;
+        let service = fetch_account_service(bmc, service_nav).await?;
 
         let mut patches = Vec::new();
         if bmc.quirks.bug_no_account_type_in_accounts() {
@@ -89,17 +149,9 @@ impl<B: Bmc> AccountService<B> {
                 Arc::new(move |v| patches.iter().fold(v, |acc, f| f(acc)));
             Some(account_read_patch_fn)
         };
-        let slot_defined_user_accounts = bmc.quirks.slot_defined_user_accounts();
         Ok(Some(Self {
-            collection_config: collection::Config {
-                account: AccountConfig {
-                    read_patch_fn: account_read_patch_fn,
-                    disable_account_on_delete: slot_defined_user_accounts
-                        .as_ref()
-                        .is_some_and(|cfg| cfg.disable_account_on_delete),
-                },
-                slot_defined_user_accounts,
-            },
+            config,
+            account_read_patch_fn,
             service,
             bmc: bmc.clone(),
         }))
@@ -114,25 +166,79 @@ impl<B: Bmc> AccountService<B> {
         self.service.clone()
     }
 
+    /// Update this account service.
+    ///
+    /// The immutable account behavior and account read-patch configuration are
+    /// retained when the response contains an updated resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating or fetching the returned entity fails.
+    pub async fn update(
+        &self,
+        update: &AccountServiceUpdate,
+    ) -> Result<ModificationResponse<Self>, Error<B>> {
+        self.bmc
+            .update::<_, NavProperty<SchemaAccountService>>(
+                self.service.odata_id(),
+                self.service.etag(),
+                update,
+            )
+            .await?
+            .try_map_entity_async(|nav| async move {
+                let service = fetch_account_service(&self.bmc, &nav).await?;
+                Ok(Self {
+                    config: self.config.clone(),
+                    account_read_patch_fn: self.account_read_patch_fn.clone(),
+                    service,
+                    bmc: self.bmc.clone(),
+                })
+            })
+            .await
+    }
+
     /// Get the accounts collection.
     ///
     /// Uses `$expand` to retrieve members in a single request when supported.
+    /// Creation, listing, and deletion use the immutable behavior selected by
+    /// the [`AccountServiceConfig`] passed to
+    /// [`ServiceRoot::account_service`](crate::ServiceRoot::account_service).
     ///
     /// # Errors
     ///
     /// Returns an error if expanding the collection fails.
     pub async fn accounts(&self) -> Result<Option<AccountCollection<B>>, Error<B>> {
         if let Some(collection_ref) = self.service.accounts.as_ref() {
-            AccountCollection::new(
-                self.bmc.clone(),
-                collection_ref,
-                self.collection_config.clone(),
-            )
-            .await
-            .map(Some)
+            let config = self
+                .config
+                .collection_config(self.account_read_patch_fn.clone());
+            AccountCollection::new(self.bmc.clone(), collection_ref, config)
+                .await
+                .map(Some)
         } else {
             Ok(None)
         }
+    }
+}
+
+/// Fetch AccountService while applying platform-specific payload repairs.
+async fn fetch_account_service<B: Bmc>(
+    bmc: &NvBmc<B>,
+    nav: &NavProperty<SchemaAccountService>,
+) -> Result<Arc<SchemaAccountService>, Error<B>> {
+    if cfg!(feature = "certificates")
+        && bmc
+            .quirks
+            .bug_incomplete_account_service_certificate_collection()
+    {
+        Payload::get(
+            bmc.as_ref(),
+            nav,
+            normalize_dpu_certificate_collection_stubs,
+        )
+        .await
+    } else {
+        nav.get(bmc.as_ref()).await.map_err(Error::Bmc)
     }
 }
 
@@ -150,4 +256,37 @@ fn append_default_account_type(v: JsonValue) -> JsonValue {
     } else {
         v
     }
+}
+
+/// Convert incomplete NVIDIA DPU certificate collection stubs to references.
+fn normalize_dpu_certificate_collection_stubs(mut value: JsonValue) -> JsonValue {
+    fn normalize(value: &mut JsonValue) {
+        match value {
+            JsonValue::Object(object) => {
+                let certificate_collection = object
+                    .get("@odata.type")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|odata_type| odata_type.starts_with("#CertificateCollection."));
+                if certificate_collection && !object.contains_key("Name") {
+                    if let Some(odata_id) = object.get("@odata.id").cloned() {
+                        object.clear();
+                        object.insert("@odata.id".to_string(), odata_id);
+                        return;
+                    }
+                }
+                for value in object.values_mut() {
+                    normalize(value);
+                }
+            }
+            JsonValue::Array(values) => {
+                for value in values {
+                    normalize(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    normalize(&mut value);
+    value
 }
